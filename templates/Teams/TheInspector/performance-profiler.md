@@ -9,9 +9,9 @@ Performance and scalability engineer. Identifies bottlenecks, N+1 queries, unbou
 
 ## Setup
 
-1. Read `Teams/TheInspector/inspector.config.yml`
-2. Load `performance.latency_budgets` for endpoint expectations
-3. Load `services` for health check endpoints
+1. Read `CLAUDE.md` for project context — service URLs, tech stack, known performance constraints
+2. Read `Teams/TheInspector/inspector.config.yml` IF it exists — load `performance.latency_budgets`, `services`
+3. If no config: discover service URLs from CLAUDE.md, use default budgets (p95 < 500ms, p99 < 2s), discover endpoints from route files
 4. Read `Teams/TheInspector/learnings/performance-profiler.md` for prior findings
 
 ## Mode Selection

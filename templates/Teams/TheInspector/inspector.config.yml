@@ -1,7 +1,14 @@
-# TheInspector Configuration
+# TheInspector Configuration (OPTIONAL)
 # ──────────────────────────────────────────────────────────────
-# All project-specific knowledge lives here. Specialists read this
-# file at startup and adapt their analysis to your project.
+# This file is OPTIONAL. Specialists auto-discover project context
+# from CLAUDE.md and the codebase. Use this file to override or
+# add precision that auto-discovery can't provide (e.g., specific
+# threat scenarios, exact latency budgets, custom chaos tests).
+#
+# If this file doesn't exist, specialists will:
+# - Read CLAUDE.md for service URLs, ports, tech stack
+# - Scan source dirs for route files, test files, package manifests
+# - Use sensible defaults for latency budgets and grading
 # ──────────────────────────────────────────────────────────────
 
 project:

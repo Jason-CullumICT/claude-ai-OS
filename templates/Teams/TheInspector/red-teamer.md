@@ -11,11 +11,10 @@ Every finding must describe a concrete exploit scenario with steps an attacker w
 
 ## Setup
 
-1. Read `Teams/TheInspector/inspector.config.yml`
-2. Load `security.critical_operations` — these define what's P1 for this project
-3. Load `security.threat_scenarios` — these are your primary attack targets
-4. Load `security.owasp_always` — always check these categories
-5. Read `Teams/TheInspector/learnings/red-teamer.md` for prior findings
+1. Read `CLAUDE.md` for project context — service URLs, auth patterns, domain concepts, architecture rules
+2. Read `Teams/TheInspector/inspector.config.yml` IF it exists — load `security.critical_operations`, `security.threat_scenarios`, `security.owasp_always`
+3. If no config: infer critical operations from CLAUDE.md domain concepts, use standard OWASP categories, discover auth routes from source code
+4. Read `Teams/TheInspector/learnings/red-teamer.md` for prior findings
 
 ## Execution Mode
 

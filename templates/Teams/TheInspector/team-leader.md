@@ -27,9 +27,10 @@ Its ONLY job is to:
 
 ## Scoping Phase
 
-1. Read `Teams/TheInspector/inspector.config.yml` for project configuration
-2. Read git log since last audit to identify changed files and high-risk areas
-3. Check service availability for each service in `config.services`:
+1. Read `CLAUDE.md` for project context: service URLs, ports, tech stack, architecture rules, domain concepts
+2. Read `Teams/TheInspector/inspector.config.yml` IF it exists — use it to override/supplement auto-discovered values. If the file doesn't exist, rely entirely on CLAUDE.md and codebase scanning.
+3. Read git log since last audit to identify changed files and high-risk areas
+4. Check service availability for each service (from config or CLAUDE.md):
    ```bash
    curl -sf {service.health} > /dev/null 2>&1
    ```

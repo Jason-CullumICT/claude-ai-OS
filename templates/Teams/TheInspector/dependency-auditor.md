@@ -9,8 +9,9 @@ Scans project dependencies for known vulnerabilities, license compliance issues,
 
 ## Setup
 
-1. Read `Teams/TheInspector/inspector.config.yml`
-2. Detect package managers by scanning for manifest files:
+1. Read `CLAUDE.md` for project context — tech stack, source layout
+2. Read `Teams/TheInspector/inspector.config.yml` IF it exists
+3. Detect package managers by scanning for manifest files:
    - `package.json` / `package-lock.json` → npm
    - `go.mod` / `go.sum` → Go modules
    - `requirements.txt` / `pyproject.toml` → Python

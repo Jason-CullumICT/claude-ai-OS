@@ -502,8 +502,8 @@ if ($Stack -eq "custom") {
     Write-Host "    - CLAUDE.md: Update Repository Layout with your source directories"
 }
 Write-Host "    - CLAUDE.md: Add extra Dev Environment rows (database, Redis, etc.)"
-Write-Host "    - Teams\TheInspector\inspector.config.yml: Configure services, specs, threats, latency budgets"
 Write-Host "    - Teams\: Customize role files for your project's modules"
+Write-Host "    - Teams\TheInspector\inspector.config.yml: (optional) Override auto-discovered settings"
 Write-Host "    - Specifications\: Add your domain specifications"
 Write-Host "    - Plans\: Create your first feature plan"
 Write-Host ""

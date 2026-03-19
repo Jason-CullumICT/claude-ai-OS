@@ -1,0 +1,187 @@
+# CLAUDE.md
+
+## This is an AI-first, spec-first project.
+
+<!-- Replace with a 1-2 sentence project description -->
+**{{PROJECT_NAME}}** — {{PROJECT_DESCRIPTION}}
+
+Every decision and line of code must trace back to a specification. If the spec doesn't cover it, write the spec first.
+
+The workflow is always: **Specifications -> Plans -> Source -> Tests**.
+
+## Read These First
+
+| Document | What it covers |
+|----------|---------------|
+| [`{{SPECS_DIR}}/`]({{SPECS_DIR}}/) | Domain specifications. **The most critical documents.** |
+| [`{{PLANS_DIR}}/`]({{PLANS_DIR}}/) | Feature plans with prompt, design, and plan files. Check here before starting new work. |
+| [`Teams/`](Teams/) | Agent team definitions and learnings |
+| [`tools/`](tools/) | Pipeline dashboard reporting and traceability enforcement |
+
+<!-- Add more rows as needed: -->
+<!-- | [`UI TESTING.md`](UI%20TESTING.md) | End-to-end smoke test procedure, environment setup, architecture notes | -->
+<!-- | [`docs/architecture.md`](docs/architecture.md) | System architecture overview and diagrams | -->
+<!-- | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution guidelines and code standards | -->
+
+## Repository Layout
+
+<!-- Customize the source layout below to match your project structure -->
+```
+Specifications/          # Domain truth (technology-agnostic)
+{{SOURCE_LAYOUT}}
+Plans/                   # Feature plans (prompt/design/plan per feature)
+Teams/                   # Agent team definitions and learnings
+tools/                   # Pipeline dashboard scripts
+```
+
+## Key Domain Concepts
+
+<!-- =================================================================== -->
+<!-- IMPORTANT: Define your project's core domain entities and rules here -->
+<!-- This section is critical — it teaches AI agents your domain language -->
+<!-- =================================================================== -->
+<!-- Delete these examples and write your own: -->
+<!-- - **User** is the central entity — has profiles, credentials, and role assignments -->
+<!-- - **Credential** = authentication token (password, API key, OAuth). Evaluated by the auth pipeline -->
+<!-- - **Workspace** = tenant container. All data is workspace-scoped. Has a billing plan and member list -->
+<!-- - **Permission** = action + resource + scope. Bundled into roles, assigned to users per workspace -->
+<!-- - **Event** = audit record. Some events are alerts that require acknowledgement -->
+<!-- - Timer resolution: 1 second -->
+
+{{DOMAIN_CONCEPTS}}
+
+## Dev Environment Quick Reference
+
+| Item | Value |
+|------|-------|
+| Backend URL | `{{BACKEND_URL}}` |
+| Frontend URL | `{{FRONTEND_URL}}` |
+| Login credentials | `{{LOGIN_CREDENTIALS}}` |
+
+<!-- Add more environment items as needed: -->
+<!-- | Database URL | `postgresql://localhost:5432/mydb` | -->
+<!-- | Redis URL | `redis://localhost:6379` | -->
+<!-- | API key | `dev-api-key-12345` in `.env` | -->
+<!-- | MFA code | `000000` (when MFA is enabled) | -->
+<!-- | MFA bypass | `DEV_SKIP_MFA=true` in `.env` | -->
+<!-- | Monitoring | `http://localhost:9090` (Prometheus) | -->
+<!-- | Grafana | `http://localhost:3003` (admin/admin) | -->
+
+## Observability
+
+All new code must maintain observability. This is an architecture rule, not optional.
+
+### Logging
+- Use structured JSON logging in production, pretty-printing in development
+- Auto-inject trace/span IDs from OpenTelemetry where available
+- Use the project's logger abstraction, never `console.log` or `log.Printf`
+- `LOG_LEVEL` env var controls verbosity
+
+### Metrics
+- Expose Prometheus-compatible metrics at `GET /metrics`
+- Auto-collect route latency via middleware
+- **When to add a new metric**: Domain-significant operations (auth decisions, state transitions, external system calls, emergency actions). Do not metric basic CRUD; do metric security and critical-path operations
+
+### Tracing
+- Use OpenTelemetry for distributed tracing
+- Auto-instrument HTTP, database, and framework calls
+- Add custom spans for critical paths
+- Propagate W3C `traceparent` header across service boundaries
+
+## Build & Test
+
+{{BUILD_COMMANDS}}
+
+## Architecture Rules
+
+These are non-negotiable. All agents and solo sessions must follow them.
+
+- **Specs are source of truth** -- implementation traces to specs, never the other way around
+- **No direct DB calls from route handlers** -- use the service layer
+- **Shared types are single source of truth** -- no inline type re-definitions across layers
+- **Every FR needs a test** with `// Verifies: FR-XXX` traceability comments
+- **Schema changes require a migration**
+- **No hardcoded secrets** -- use environment variables via `.env`
+- **All list endpoints return `{data: T[]}` wrappers** -- use the response patterns below
+- **New routes must have observability** -- structured logging (not console.log), Prometheus metrics for domain-significant operations
+- **Business logic has no framework imports** -- keep domain logic in pure functions/services
+- **Shared type changes affect multiple layers** -- coordinate across layers before editing
+
+<!-- Add project-specific rules as needed: -->
+<!-- - **Frontend UI must use [component library]** -- all user-facing UI elements must use the shared component primitives -->
+<!-- - **Frontend styling is Tailwind-only** -- no CSS modules, no inline styles except for dynamic values -->
+<!-- - **Icons use lucide-react** -- import from `lucide-react`, no other icon libraries -->
+
+**API response patterns:**
+
+| Pattern | Type | Example |
+|---------|------|---------|
+| Paginated list | `PaginatedResponse<T>` | `{data: [...], page, limit, total, totalPages}` |
+| Simple list | `DataResponse<T>` | `{data: [...]}` |
+| Single item | `T` directly | `{id, name, ...}` |
+| Delete | `204 No Content` | (no body) |
+| Error | `ApiErrorResponse` | `{error: "message"}` |
+
+## Testing Rules
+
+Write tests before or alongside implementation. Run verification gates before marking any task done.
+
+**Verification gates:**
+```bash
+{{VERIFICATION_GATES}}
+```
+
+If any gate fails: fix it, re-run the full gate sequence, then mark done.
+
+**Baseline comparison**: Before starting work, note which tests are already failing. You are responsible for **zero new failures** -- if your changes break a test, fix it before committing.
+
+**Fix broken tests in your area**: If there are pre-existing test failures in files related to your change (same page, same hook, same module), you must fix them as part of your work. Don't leave broken tests behind in code you're already touching.
+
+## MCP Tools
+
+<!-- Add your MCP tool references here. Examples: -->
+<!-- **Documentation** (`docs`): `mcp__docs__search`, `mcp__docs__get` -- search project documentation -->
+<!-- **Chrome** (`claude-in-chrome`): `mcp__claude-in-chrome__navigate`, `mcp__claude-in-chrome__read_page` -- browser automation for UI testing -->
+<!-- **Database** (`db`): `mcp__db__query` -- query development database -->
+<!-- **Context7** (`context7`): `mcp__context7__resolve-library-id`, `mcp__context7__query-docs` -- look up library documentation -->
+
+## Agent Teams
+
+**Source code changes MUST go through a team pipeline** (TheATeam or TheFixer) for QA, code review, traceability, and test coverage. Solo sessions may edit `Specifications/`, `Plans/`, `Teams/`, `docs/`, and `tools/` freely. If a solo session must touch `Source/` (e.g., urgent hotfix), it MUST run all verification gates, confirm zero new failures, and update any broken tests before committing.
+
+**Team leader orchestration-only rule** -- Team leaders are STRICTLY orchestrators. They spawn agents via the Agent tool and route results between stages. They MUST NOT edit Source/ files, run tests, or perform any work that belongs to a pipeline role (planner, coder, fixer, QA, security). Every pipeline stage MUST be a separate Agent tool invocation. If a team leader cannot spawn subagents, it MUST stop and report the limitation -- never fall back to doing the work itself. This is a checks-and-balances architecture; the separation of concerns is non-negotiable.
+
+**Team leader dispatch pattern** -- Team leaders produce plans but cannot dispatch subagents when spawned as subagents themselves. The parent session dispatches implementation agents based on the leader's plan. No agent should do both planning and implementation in the same invocation.
+
+**Module ownership** -- agents MUST stay within their assigned module. Cross-module changes require coordination.
+
+| Module | Owner | Notes |
+|--------|-------|-------|
+| `Source/Backend/` | backend-coder | Routes, services, database, tests |
+| `Source/Frontend/` | frontend-coder | Components, hooks, pages, tests |
+| `Source/Shared/` | api-contract | Shared types -- backend-coder may update if no api-contract agent in pipeline |
+| `Specifications/` | requirements-reviewer | Domain truth documents |
+
+<!-- Add more modules as needed: -->
+<!-- | `Source/Controller/` | controller-coder | Firmware, hardware interfaces | -->
+<!-- | `Source/Mobile/` | mobile-coder | Mobile app, native modules | -->
+<!-- | `infrastructure/` | devops | Docker, CI/CD, monitoring | -->
+
+**Team rules** (when running as part of any agent team):
+1. **Read `CLAUDE.md` in full** before starting any task
+2. **Stay in your module** -- do not edit files outside your assigned scope
+3. **Run verification gates** before reporting completion -- all gates must pass with zero new failures
+4. **Share findings** via `agent.md` when you discover something that affects other agents
+5. **Do not suppress test output** or use `--passWithNoTests` or equivalent flags
+6. **Do not skip verification** -- even if you're confident the code is correct
+7. If you change a source file, you own updating its tests -- never commit source changes that break existing tests
+
+**Self-learning**: Agents maintain persistent learnings at `Teams/{team}/learnings/{role}.md` -- read at start, write new discoveries at end.
+
+**Dashboard reporting**: Agents report progress to `tools/pipeline-state-{team}.json` via `tools/pipeline-update.sh` (see `tools/README.md`).
+
+## Session Hygiene
+
+- `/clear` between unrelated tasks
+- At 70% context, compact or start fresh
+- Corrected twice on same mistake? `/clear` and restart

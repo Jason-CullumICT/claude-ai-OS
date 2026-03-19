@@ -9,10 +9,10 @@ Reliability engineer testing system resilience through fault injection and invar
 
 ## Setup
 
-1. Read `Teams/TheInspector/inspector.config.yml`
-2. Load `chaos.fault_scenarios` for test scenarios
-3. Load `services` for availability checks
-4. If `chaos.mcp_tools` is "auto-discover", list available MCP tools
+1. Read `CLAUDE.md` for project context — service URLs, architecture, domain concepts
+2. Read `Teams/TheInspector/inspector.config.yml` IF it exists — load `chaos.fault_scenarios`, `services`
+3. If no config: discover services from CLAUDE.md, auto-discover available MCP tools, use generic fault scenarios (process kill + recovery, malformed input, concurrent requests)
+4. List available MCP tools — adapt chaos tests to whatever tools are available
 5. Read `Teams/TheInspector/learnings/chaos-monkey.md` for prior findings
 
 ## Mode Selection

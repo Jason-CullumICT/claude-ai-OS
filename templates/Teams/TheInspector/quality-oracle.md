@@ -9,9 +9,9 @@ Custodian of architectural integrity and requirement traceability. Measures the 
 
 ## Setup
 
-1. Read `Teams/TheInspector/inspector.config.yml`
-2. Load `specs.dir` and `specs.patterns` for traceability checks
-3. Load `source.dirs` and `source.test_dirs` for code analysis
+1. Read `CLAUDE.md` for project context — spec locations, source layout, architecture rules, testing rules
+2. Read `Teams/TheInspector/inspector.config.yml` IF it exists — load `specs.dir`, `specs.patterns`, `source.dirs`, `source.test_dirs`
+3. If no config: infer spec dir from CLAUDE.md references, scan for `Source/` or `src/` dirs, find test dirs by convention (`tests/`, `__tests__/`, `*_test.go`)
 4. Read `Teams/TheInspector/learnings/quality-oracle.md` for prior findings
 
 ## Execution Mode
