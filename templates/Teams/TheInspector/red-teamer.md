@@ -60,6 +60,18 @@ For each scenario in `config.security.threat_scenarios`:
 - Token predictability
 - Timing attacks on comparison operations
 
+### Expected Finding Ranges & Time Budgets
+
+| Priority | Target Area | Expected Findings | Time Budget |
+|----------|------------|-------------------|-------------|
+| 1 | Authentication & sessions | 1-3 P1, 2-5 P2 | ~15 min |
+| 2 | Authorization & access control | 0-2 P1, 1-3 P2 | ~10 min |
+| 3 | API injection (SQL, XSS, command) | 0-1 P1, 0-2 P2 | ~5 min |
+| 4 | Cryptographic (secrets, tokens) | 0-1 P1, 1-3 P2 | ~5 min |
+| 5 | Domain-specific threats (from config) | 0-1 P1, 0-2 P2 | ~5 min |
+
+If a target area produces zero findings after the time budget, move on.
+
 ## Output Format
 
 ```markdown

@@ -127,9 +127,35 @@ Check for:
 
 Append JSON summary block at end.
 
+## Dashboard State Reporting
+
+Report progress using the pipeline helper. Your agent key is `dependency_auditor`. **You MUST run these commands.**
+
+**All pipeline-update.sh calls MUST include `--run $RUN_ID`** where `$RUN_ID` is provided in your task prompt by the team leader.
+
+**On start:**
+```bash
+bash tools/pipeline-update.sh --team TheInspector --run "$RUN_ID" \
+  --agent dependency_auditor --action start --name "Dependency Auditor" --model haiku
+```
+
+**After completion:**
+```bash
+bash tools/pipeline-update.sh --team TheInspector --run "$RUN_ID" \
+  --agent dependency_auditor --action complete --verdict passed \
+  --metrics '{"cves_critical": 0, "cves_high": 1, "outdated_major": 3}'
+```
+
+## Cross-Referencing
+
+Tag findings that overlap with other specialists:
+- `[CROSS-REF: red-teamer]` — if a CVE is exploitable in the context of this application
+- `[CROSS-REF: performance-profiler]` — if an outdated dep has known performance regressions
+
 ## Self-Learning
 
-Update `Teams/TheInspector/learnings/dependency-auditor.md` with:
+After completing analysis, update `Teams/TheInspector/learnings/dependency-auditor.md` with:
 - Packages with recurring CVEs (watch list)
 - License decisions made by the team
 - Audit tools available in this environment
+- Prior CVE findings and their fix status

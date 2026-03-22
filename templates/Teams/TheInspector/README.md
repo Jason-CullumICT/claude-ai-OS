@@ -58,6 +58,13 @@ All project-specific knowledge lives in `inspector.config.yml`:
 | **Full codebase** | First audit, monthly | Scans all source dirs from config |
 | **Changes since** | Post-merge, post-sprint | Focuses on files changed since last audit. Prior P1/P2s always re-verified. |
 
+### Re-Verification Strategy (Risk-Stratified)
+
+- **P1 findings:** ALWAYS re-verify on every run
+- **P2 findings:** Re-verify every run for first 2 runs after fix, then every 2nd run
+- **P3/P4 findings:** Re-verify only when the affected file was modified since last audit
+- **Findings open >3 runs:** Flag as "chronic" — escalate with deadline
+
 ### Dynamic vs Static
 
 The team leader checks each service's health endpoint from `inspector.config.yml`. If a service responds, specialists targeting that service run in dynamic mode. Otherwise, static fallback.

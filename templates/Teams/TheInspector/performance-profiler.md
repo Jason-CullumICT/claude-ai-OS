@@ -47,7 +47,19 @@ for i in $(seq 1 10); do
 done
 ```
 
-Compare against `config.performance.latency_budgets`:
+### Latency Budgets
+
+| Endpoint Category | Dev Budget (p95) | Alert Threshold |
+|-------------------|-------------------|-----------------|
+| Health/metrics | 50ms | >100ms |
+| Authentication | 200ms | >500ms |
+| List endpoints (paginated) | 500ms | >2000ms |
+| Emergency/critical operations | 200ms | >1000ms |
+| Default (single entity CRUD) | 200ms | >500ms |
+
+Override with project-specific budgets from inspector.config.yml if available.
+
+Compare against the latency budgets above (or `config.performance.latency_budgets` if configured):
 - p95 > budget → P2 finding
 - p95 > 2x budget → P1 finding
 

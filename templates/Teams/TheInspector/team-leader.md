@@ -90,8 +90,45 @@ After all specialists report back:
 2. Deduplicate cross-cutting findings (tagged with `[CROSS-REF: specialist]`)
 3. Assign overall grade using `config.grading` thresholds
 4. Compare with prior audit if available (FIXED / STILL OPEN / REGRESSED / NEW)
-5. Generate HTML report and bug backlog JSON
-6. Save to paths from `config.report`
+5. Generate HTML report with all 16 mandatory sections (see below)
+6. Generate bug backlog JSON with all P1/P2 findings
+7. Save to paths from `config.report`
+
+### Mandatory Report Sections (16)
+
+The HTML report MUST contain all 16 sections. No section may be omitted. If a section has no data, include it with "None" rather than removing it.
+
+| # | Section | Source | Content |
+|---|---------|--------|---------|
+| 1 | **Header** | team-leader | Grade badge (A=green, B=blue, C=yellow, D=orange, F=red), branch, date, scope mode |
+| 2 | **Scorecards** | all specialists | P1/P2/P3/P4 counts, spec coverage %, dynamic mode count, FIXED count |
+| 3 | **Executive Summary** | team-leader | Top 5 findings in plain language — what an operator needs to know |
+| 4 | **Scope & Environment** | team-leader | What was audited, test data size, specialist modes/durations, data caveats |
+| 5 | **Trend** | team-leader | Grade comparison with prior audit. If no prior audit: "First audit — no baseline" |
+| 6 | **Specialist Reports** | all specialists | One card per specialist: mode, verdict, finding counts, duration |
+| 7 | **Re-Verification Summary** | all specialists | FIXED / STILL OPEN / REGRESSED / NEW roll-up table across all specialists |
+| 8 | **Cross-Reference Map** | team-leader | Root causes that span multiple specialists — shows which single fix resolves findings from 2+ specialists |
+| 9 | **P1 Findings** | all specialists | Expanded cards with file paths, exploit scenario, impact, recommendation |
+| 10 | **Risk Matrix** | team-leader | 2-axis grid: Severity (P1-P4) vs Exploitability (zero-precondition to insider/physical) |
+| 11 | **Spec Coverage** | quality-oracle | Coverage % with bar chart. List top 10 uncovered requirements |
+| 12 | **Latency Baselines** | performance-profiler | p50/p95/p99 per endpoint, budget breach highlighting. Flag regressions vs prior audit |
+| 13 | **P2 Findings** | all specialists | Compact table: ID, Category, Title, File, Status (NEW/STILL OPEN/REGRESSED) |
+| 14 | **Fixed Findings** | all specialists | Green-highlighted cards for items resolved since prior audit |
+| 15 | **Recommendations** | team-leader | Prioritised action list: "Block deployment" / "This sprint" / "Next sprint" / "Backlog" |
+| 16 | **P3/P4 Summary** | all specialists | Compact table for lower-severity items |
+
+**Section 8 (Cross-Reference Map) is critical for remediation planning.** Build it by:
+1. Collect all `[CROSS-REF: specialist]` tags from specialist reports
+2. Group findings that share the same root cause
+3. For each group, identify the single fix that resolves all findings in the group
+4. Present as a table: Root Cause → Affected Findings → Fix Impact
+
+**Section 10 (Risk Matrix) exploitability scale:**
+- **Zero-precondition:** Any user on the network (no auth needed)
+- **Authenticated:** Requires valid credentials (any role)
+- **Privileged:** Requires specific permissions
+- **Admin:** Requires admin/superuser role
+- **Physical:** Requires physical access to hardware
 
 ## Dashboard Reporting
 

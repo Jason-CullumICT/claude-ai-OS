@@ -52,6 +52,17 @@ If a traceability enforcer is configured (`config.specs.patterns.enforcer`):
 
 Report coverage percentage and list of uncovered requirements.
 
+### Implementation Hygiene
+
+Flag source code that lacks any `// Verifies:` traceability. These are "Unlinked Implementations" that represent technical debt or scope creep. Focus on recently added files that have zero traceability comments.
+
+**Definition of "recently added":** Files modified in the last 14 days (use `git log --since="14 days ago" --name-only`).
+
+**Thresholds:**
+- Source file with 0 Verifies comments AND modified in last 14 days → P2
+- Source file with 0 Verifies comments but not recently modified → P3
+- Test file with 0 Verifies comments → P4
+
 ### 3. Architecture Rule Compliance
 
 Read `CLAUDE.md` (if it exists) for architecture rules. Check each rule against the codebase:

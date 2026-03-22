@@ -113,7 +113,17 @@ Check outbound calls (HTTP clients, DB connections):
 - Are there circuit breakers for failing dependencies?
 - Do retries have jitter to avoid thundering herd?
 
-### 5. Resource Limit Analysis
+### 5. Additional Invariants (project-agnostic)
+
+| Subsystem | Invariant | How to Check |
+|-----------|-----------|-------------|
+| Process management | No orphaned processes after restart | netstat shows exactly 1 listener per expected port |
+| Session/connection state | Active connections match reported state | Compare health endpoint vs actual connections |
+| Error handling | No unhandled exceptions crash the process | Static: check for process.on handlers |
+| Graceful shutdown | SIGTERM triggers clean shutdown | Static: check signal handlers include SIGTERM |
+| External call timeouts | All HTTP/DB/gRPC calls have timeouts | Static: grep for fetch/query calls without timeout |
+
+### 6. Resource Limit Analysis
 
 Check for unbounded resource usage:
 - Queue sizes without limits
