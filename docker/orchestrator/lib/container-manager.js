@@ -108,9 +108,6 @@ class ContainerManager {
       HostConfig: {
         Binds: [
           `${volumeName}:/workspace`,
-          // Mount the same claude-config volume the orchestrator uses
-          // Docker Compose prefixes volume names with project name (e.g., docker_claude-config)
-          `${this._claudeConfigVolume || "docker_claude-config"}:/root/.claude:ro`,
         ],
         PortBindings: {
           "3001/tcp": [{ HostPort: String(ports.backend) }],
@@ -141,12 +138,33 @@ class ContainerManager {
 
     console.log(`[container] ${containerName} started (id: ${container.id.slice(0, 12)})`);
 
+    // Inject Claude credentials from orchestrator into worker
+    await this._injectCredentials(container.id);
+
     return {
       containerId: container.id,
       containerName,
       ports,
       tokenId: token.tokenId,
     };
+  }
+
+  async _injectCredentials(containerId) {
+    // Read credentials from orchestrator's own filesystem (bind-mounted from host)
+    const credPath = "/root/.claude/.credentials.json";
+    try {
+      const creds = readFileSync(credPath, "utf-8");
+      // Write into worker via exec
+      await this.docker.execInContainer(
+        containerId, "bash", ["-c",
+          `mkdir -p /root/.claude && cat > /root/.claude/.credentials.json << 'CREDEOF'\n${creds}\nCREDEOF\nchmod 600 /root/.claude/.credentials.json`
+        ],
+        { label: "auth", quiet: true }
+      );
+      console.log("[container] Credentials injected into worker");
+    } catch (err) {
+      console.warn(`[container] Failed to inject credentials: ${err.message}`);
+    }
   }
 
   async initWorkspace(containerId, runId) {

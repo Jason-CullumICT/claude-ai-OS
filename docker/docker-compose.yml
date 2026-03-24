@@ -98,7 +98,6 @@ services:
       context: .
       dockerfile: Dockerfile.worker
     environment:
-      - CLAUDE_SESSION_TOKEN=${CLAUDE_SESSION_TOKEN}
       - WORKSPACE_DIR=/workspace
       # Model selection is defined per-agent in Teams/*.md role files
     volumes:
