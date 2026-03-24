@@ -39,8 +39,6 @@ services:
       dockerfile: Dockerfile.orchestrator
     ports:
       - "${DASHBOARD_PORT:-8080}:8080"     # API + Pipeline dashboard
-      - "${PORTAL_BACKEND_PORT:-4001}:3001"  # Feature portal backend (main workspace)
-      - "${PORTAL_FRONTEND_PORT:-4173}:5173" # Feature portal frontend (main workspace)
     environment:
       - GITHUB_REPO=${GITHUB_REPO:-https://github.com/your-org/your-project.git}
       - GITHUB_BRANCH=${GITHUB_BRANCH:-main}
@@ -142,11 +140,44 @@ services:
       - claude-net
     restart: unless-stopped
 
+  # ════════════════════════════════════════════
+  # Feature Portal — independent container-test app
+  # ════════════════════════════════════════════
+  portal:
+    image: node:22-slim
+    ports:
+      - "${PORTAL_BACKEND_PORT:-4001}:3001"
+      - "${PORTAL_FRONTEND_PORT:-4173}:5173"
+    environment:
+      - ORCHESTRATOR_URL=http://orchestrator:8080
+      - NODE_ENV=development
+      - PORT=3001
+    volumes:
+      - portal-data:/app
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        apt-get update && apt-get install -y git > /dev/null 2>&1
+        if [ ! -f /app/.git/HEAD ]; then
+          git clone https://github.com/Jason-CullumICT/container-test /app
+        else
+          cd /app && git pull origin master || true
+        fi
+        cd /app/Source/Backend && npm install --production=false 2>/dev/null
+        cd /app/Source/Frontend && npm install --production=false 2>/dev/null
+        cd /app/Source/Backend && npx ts-node src/index.ts &
+        cd /app/Source/Frontend && npx vite --host 0.0.0.0 --port 5173
+    networks:
+      - claude-net
+    restart: unless-stopped
+
 volumes:
-  workspace:       # Cloned project repo
+  workspace:       # Cloned project repo (orchestrator target)
   claude-config:   # Claude Code auth + settings
   pipeline-state:  # Pipeline JSON state files
   test-results:    # Playwright test results + reports
+  portal-data:     # Feature portal (container-test) persistent clone
 
 networks:
   claude-net:
