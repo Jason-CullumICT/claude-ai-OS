@@ -186,7 +186,6 @@ class ContainerManager {
   }
 
   async startApp(containerId) {
-    // Check what exists and start appropriately
     const checkBackend = await this.docker.execInContainer(
       containerId, "test", ["-f", "/workspace/Source/Backend/package.json"],
       { quiet: true }
@@ -199,13 +198,25 @@ class ContainerManager {
     const result = { backend: false, frontend: false };
 
     if (checkBackend.exitCode === 0) {
-      // Start backend in background
+      // Detect entry point: try common patterns
+      // nohup ensures process survives after exec session ends
       await this.docker.execInContainer(
         containerId, "bash", ["-c",
-          "cd /workspace/Source/Backend && " +
-          "(npx ts-node src/index.ts > /tmp/backend.log 2>&1 &) || " +
-          "(node dist/index.js > /tmp/backend.log 2>&1 &) || " +
-          "(npm start > /tmp/backend.log 2>&1 &)"
+          `cd /workspace/Source/Backend && ` +
+          `ENTRY=$(` +
+          `  if [ -f src/index.ts ]; then echo "npx ts-node src/index.ts"; ` +
+          `  elif [ -f src/server.ts ]; then echo "npx ts-node src/server.ts"; ` +
+          `  elif [ -f src/app.ts ]; then echo "npx ts-node src/app.ts"; ` +
+          `  elif [ -f dist/index.js ]; then echo "node dist/index.js"; ` +
+          `  elif [ -f dist/server.js ]; then echo "node dist/server.js"; ` +
+          `  elif grep -q '"start"' package.json 2>/dev/null; then echo "npm start"; ` +
+          `  else echo ""; fi` +
+          `) && ` +
+          `if [ -n "$ENTRY" ]; then ` +
+          `  echo "[app] Starting backend: $ENTRY" && ` +
+          `  nohup $ENTRY > /tmp/backend.log 2>&1 & ` +
+          `  disown; ` +
+          `fi`
         ],
         { label: "app:backend", quiet: true }
       );
@@ -215,7 +226,7 @@ class ContainerManager {
     if (checkFrontend.exitCode === 0) {
       await this.docker.execInContainer(
         containerId, "bash", ["-c",
-          "cd /workspace/Source/Frontend && npx vite --host 0.0.0.0 --port 5173 > /tmp/frontend.log 2>&1 &"
+          "cd /workspace/Source/Frontend && nohup npx vite --host 0.0.0.0 --port 5173 > /tmp/frontend.log 2>&1 & disown"
         ],
         { label: "app:frontend", quiet: true }
       );
