@@ -1215,6 +1215,16 @@ app.listen(PORT, "0.0.0.0", async () => {
   console.log(`  Workspace:  ${WORKSPACE}`);
   console.log(`  Dispatch:   multi-stage with ${MAX_FEEDBACK_LOOPS} feedback loops`);
 
+  // Docker API connectivity check (temporary — will move to proper module)
+  try {
+    const Docker = require("dockerode");
+    const docker = new Docker({ socketPath: "/var/run/docker.sock" });
+    await docker.ping();
+    console.log("[docker] Docker API connected");
+  } catch (err) {
+    console.log("[docker] Docker socket not available — parallel cycles disabled");
+  }
+
   // Auto-start app if Source/ exists from a previous pipeline run
   const hasBackend = existsSync(join(WORKSPACE, "Source/Backend/package.json"));
   const hasFrontend = existsSync(join(WORKSPACE, "Source/Frontend/package.json"));

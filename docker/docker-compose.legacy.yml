@@ -39,22 +39,16 @@ services:
       dockerfile: Dockerfile.orchestrator
     ports:
       - "${DASHBOARD_PORT:-8080}:8080"     # API + Pipeline dashboard
+      - "${APP_BACKEND_PORT:-4001}:3001"   # Built app backend (host:4001 → container:3001)
+      - "${APP_FRONTEND_PORT:-4173}:5173"  # Built app frontend (host:4173 → container:5173)
     environment:
       - GITHUB_REPO=${GITHUB_REPO:-https://github.com/your-org/your-project.git}
       - GITHUB_BRANCH=${GITHUB_BRANCH:-main}
       - GITHUB_TOKEN=${GITHUB_TOKEN:-}
       - PROJECT_NAME=${PROJECT_NAME:-my-project}
       - WORKSPACE_DIR=/workspace
-      - PORT_RANGE_BACKEND_START=5001
-      - PORT_RANGE_FRONTEND_START=5101
-      - PORT_RANGE_SIZE=99
-      - CYCLE_TIMEOUT_MS=7200000
-      - PHASE_TIMEOUT_MS=1800000
-      - VOLUME_RETENTION_HOURS=24
-      - WORKER_IMAGE=claude-ai-os-worker:latest
       # Model selection is defined per-agent in Teams/*.md role files
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
       - workspace:/workspace
       - claude-config:/root/.claude
       - ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro  # Live token from host
