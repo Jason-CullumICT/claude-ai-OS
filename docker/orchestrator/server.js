@@ -21,10 +21,11 @@
 const express = require("express");
 const multer = require("multer");
 const { spawn } = require("child_process");
-const { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } = require("fs");
+const { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } = require("fs");
 const { join } = require("path");
 const { randomUUID } = require("crypto");
 const { createDispatcher } = require("./lib/dispatch");
+const { WorkflowEngine } = require("./lib/workflow-engine");
 
 const app = express();
 app.use(express.json({ limit: "50mb" }));
@@ -42,8 +43,6 @@ const upload = multer({
 const PORT = 8080;
 const WORKSPACE = process.env.WORKSPACE_DIR || "/workspace";
 const RUNS_DIR = join(WORKSPACE, ".orchestrator-runs");
-const MAX_FEEDBACK_LOOPS = 2;
-
 if (!existsSync(RUNS_DIR)) mkdirSync(RUNS_DIR, { recursive: true });
 
 // ══════════════════════════════════════════════════════════════
@@ -180,503 +179,28 @@ function runClaude(prompt, { maxTurns, tools, label, quiet } = {}) {
 
 const dispatch = createDispatcher(runClaude, WORKSPACE);
 
-// ══════════════════════════════════════════════════════════════
-// Agent Execution
-// ══════════════════════════════════════════════════════════════
-
-/**
- * Run a single coding/QA agent via claude -p.
- * Agents get file tools but NOT the Agent tool (only leaders orchestrate).
- */
-async function runAgent(role, prompt, feedback) {
-  let fullPrompt = prompt;
-  if (feedback) {
-    fullPrompt += `\n\n═══════════════════════════════════════════
-QA FEEDBACK — You MUST address these issues before completing:
-═══════════════════════════════════════════
-${feedback}`;
-  }
-
-  console.log(`    [agent] ${role} starting...`);
-  const result = await runClaude(fullPrompt, {
-    tools: "Bash,Read,Write,Edit,Glob,Grep",
-    label: role,
-  });
-  console.log(`    [agent] ${role} done (exit: ${result.exitCode})`);
-  return result;
-}
-
-/**
- * Execute a single stage (group of agents, parallel or sequential).
- * Returns { passed, agentResults }.
- */
-async function executeStage(stage, feedback) {
-  const runOne = async (agent) => {
-    const result = await runAgent(agent.role, agent.prompt, feedback);
-    return {
-      role: agent.role,
-      exitCode: result.exitCode,
-      outputTail: result.stdout.slice(-2000),
-    };
-  };
-
-  let agentResults;
-  if (stage.parallel) {
-    agentResults = await Promise.all(stage.agents.map(runOne));
-  } else {
-    agentResults = [];
-    for (const agent of stage.agents) {
-      agentResults.push(await runOne(agent));
-    }
-  }
-
-  const passed = agentResults.every((ar) => ar.exitCode === 0);
-  return { passed, agentResults };
-}
-
-// ══════════════════════════════════════════════════════════════
-// Workflow Engine — Multi-Stage Dispatch with Feedback Loops
-// ══════════════════════════════════════════════════════════════
-
-async function executeWorkflow(run) {
-  // Build image context string for prompts
-  const imageContext = run.attachments && run.attachments.length > 0
-    ? `\n\nReference images (use the Read tool to view these):\n${run.attachments.map((p) => `- ${p}`).join("\n")}`
-    : "";
-
-  try {
-    // ── Phase 1: Team leader produces plan ──
-    run.status = "planning";
-    run.phases = { leader: { status: "running", startedAt: ts() } };
-    saveRun(run);
-
-    console.log(`[${run.id}] Phase 1: ${run.team} leader planning...`);
-
-    // Append image references to task so the leader sees them
-    const taskWithImages = run.task + imageContext;
-
-    const leaderResult = await runScript("/app/scripts/run-team.sh", [
-      run.team,
-      taskWithImages,
-      run.planFile || "",
-    ], { label: `${run.team}-leader` });
-
-    run.phases.leader.status = leaderResult.exitCode === 0 ? "passed" : "failed";
-    run.phases.leader.exitCode = leaderResult.exitCode;
-    run.phases.leader.completedAt = ts();
-    run.phases.leader.outputTail = leaderResult.stdout.slice(-3000);
-    saveRun(run);
-
-    if (leaderResult.exitCode !== 0) {
-      console.log(`[${run.id}] Leader failed (exit ${leaderResult.exitCode})`);
-      run.status = "failed";
-      run.results = { leader: "failed", allPassed: false };
-      saveRun(run);
-      return;
-    }
-
-    console.log(`[${run.id}] Leader plan complete`);
-
-    // ── Phase 2: Parse dispatch plan ──
-    run.status = "dispatching";
-    saveRun(run);
-
-    console.log(`[${run.id}] Phase 2: Parsing dispatch plan...`);
-
-    let dispatchPlan;
-    try {
-      dispatchPlan = await dispatch.parseDispatchPlan(leaderResult.stdout, taskWithImages, run.team);
-      // Inject image context into every agent prompt
-      if (imageContext) {
-        for (const stage of dispatchPlan.stages) {
-          for (const agent of stage.agents) {
-            if (!agent.prompt.includes("Read tool to view")) {
-              agent.prompt += imageContext;
-            }
-          }
-        }
-      }
-      console.log(`[${run.id}] Parsed: ${dispatchPlan.stages.length} stages, ${
-        dispatchPlan.stages.reduce((n, s) => n + s.agents.length, 0)
-      } agents`);
-    } catch (err) {
-      console.warn(`[${run.id}] Parse failed (${err.message}), using fallback plan`);
-      dispatchPlan = dispatch.buildFallbackPlan(taskWithImages, run.team, leaderResult.stdout);
-    }
-
-    run.phases.dispatch = {
-      plan: dispatchPlan,
-      stageCount: dispatchPlan.stages.length,
-      agentCount: dispatchPlan.stages.reduce((n, s) => n + s.agents.length, 0),
-      parsedAt: ts(),
-    };
-    saveRun(run);
-
-    // ── Phase 3: Execute stages with feedback loops ──
-    let feedbackLoops = 0;
-    let lastImplStageIdx = -1;
-
-    for (let i = 0; i < dispatchPlan.stages.length; i++) {
-      const stage = dispatchPlan.stages[i];
-      const isQA = /qa|verification|review|test/i.test(stage.name);
-      if (!isQA) lastImplStageIdx = i;
-
-      const stageKey = `stage_${i}_${stage.name}`;
-      run.status = isQA ? "qa_running" : "implementing";
-      run.phases[stageKey] = {
-        status: "running",
-        startedAt: ts(),
-        stageName: stage.name,
-        parallel: stage.parallel,
-        agents: {},
-      };
-      saveRun(run);
-
-      console.log(`[${run.id}] Stage ${i + 1}/${dispatchPlan.stages.length}: ${stage.name} (${stage.agents.length} agent(s), parallel=${stage.parallel})`);
-
-      const { passed, agentResults } = await executeStage(stage);
-
-      // Record per-agent results
-      for (const ar of agentResults) {
-        run.phases[stageKey].agents[ar.role] = {
-          status: ar.exitCode === 0 ? "passed" : "failed",
-          exitCode: ar.exitCode,
-          outputTail: ar.outputTail,
-        };
-      }
-      run.phases[stageKey].status = passed ? "passed" : "failed";
-      run.phases[stageKey].completedAt = ts();
-      saveRun(run);
-
-      console.log(`[${run.id}] Stage ${stage.name}: ${passed ? "PASSED" : "FAILED"}`);
-
-      // ── Feedback loop: QA failed → re-run implementation + QA ──
-      if (isQA && !passed && feedbackLoops < MAX_FEEDBACK_LOOPS && lastImplStageIdx >= 0) {
-        feedbackLoops++;
-        console.log(`[${run.id}] Feedback loop ${feedbackLoops}/${MAX_FEEDBACK_LOOPS}: QA → implementation → QA`);
-
-        // Collect QA feedback from failed agents
-        const feedback = agentResults
-          .filter((ar) => ar.exitCode !== 0)
-          .map((ar) => `── ${ar.role} (FAILED) ──\n${ar.outputTail.slice(-1000)}`)
-          .join("\n\n");
-
-        // Re-run implementation with feedback
-        const implStage = dispatchPlan.stages[lastImplStageIdx];
-        const fbImplKey = `feedback_${feedbackLoops}_${implStage.name}`;
-        run.status = "implementing";
-        run.phases[fbImplKey] = { status: "running", startedAt: ts(), agents: {} };
-        saveRun(run);
-
-        console.log(`[${run.id}]   Re-running ${implStage.name} with QA feedback...`);
-        const implResult = await executeStage(implStage, feedback);
-
-        for (const ar of implResult.agentResults) {
-          run.phases[fbImplKey].agents[ar.role] = {
-            status: ar.exitCode === 0 ? "passed" : "failed",
-            exitCode: ar.exitCode,
-            outputTail: ar.outputTail,
-          };
-        }
-        run.phases[fbImplKey].status = implResult.passed ? "passed" : "failed";
-        run.phases[fbImplKey].completedAt = ts();
-        saveRun(run);
-
-        // Re-run QA
-        const fbQaKey = `feedback_${feedbackLoops}_${stage.name}`;
-        run.status = "qa_running";
-        run.phases[fbQaKey] = { status: "running", startedAt: ts(), agents: {} };
-        saveRun(run);
-
-        console.log(`[${run.id}]   Re-running ${stage.name}...`);
-        const qaResult2 = await executeStage(stage);
-
-        for (const ar of qaResult2.agentResults) {
-          run.phases[fbQaKey].agents[ar.role] = {
-            status: ar.exitCode === 0 ? "passed" : "failed",
-            exitCode: ar.exitCode,
-            outputTail: ar.outputTail,
-          };
-        }
-        run.phases[fbQaKey].status = qaResult2.passed ? "passed" : "failed";
-        run.phases[fbQaKey].completedAt = ts();
-        saveRun(run);
-
-        if (!qaResult2.passed) {
-          console.log(`[${run.id}]   QA still failing after feedback loop ${feedbackLoops}`);
-        }
-      }
-    }
-
-    run.feedbackLoops = feedbackLoops;
-
-    // ── Phase 4: Final validation (smoketest + inspector in parallel) ──
-    run.status = "validating";
-    run.phases.smoketest = { status: "running", startedAt: ts() };
-    run.phases.inspector = { status: "running", startedAt: ts() };
-    saveRun(run);
-
-    console.log(`[${run.id}] Phase 4: Validation (smoketest + inspector)`);
-
-    const [smokeResult, inspectorResult] = await Promise.all([
-      runScript("/app/scripts/run-smoketest.sh", [], { label: "smoketest" }),
-      runScript("/app/scripts/run-team.sh", [
-        "TheInspector",
-        `Post-work audit after ${run.team} completed: ${run.task}`,
-      ], { label: "inspector" }),
-    ]);
-
-    run.phases.smoketest.status = smokeResult.exitCode === 0 ? "passed" : "failed";
-    run.phases.smoketest.exitCode = smokeResult.exitCode;
-    run.phases.smoketest.completedAt = ts();
-    run.phases.smoketest.outputTail = smokeResult.stdout.slice(-2000);
-
-    run.phases.inspector.status = inspectorResult.exitCode === 0 ? "passed" : "failed";
-    run.phases.inspector.exitCode = inspectorResult.exitCode;
-    run.phases.inspector.completedAt = ts();
-    run.phases.inspector.outputTail = inspectorResult.stdout.slice(-2000);
-
-    // ── Phase 5: Final result ──
-    const implPassed = Object.keys(run.phases)
-      .filter((k) => k.startsWith("stage_") || k.startsWith("feedback_"))
-      .every((k) => run.phases[k].status === "passed");
-
-    const qaPassed = Object.keys(run.phases)
-      .filter((k) => k.startsWith("stage_") && run.phases[k].stageName && /qa|verification|review/i.test(run.phases[k].stageName))
-      .every((k) => run.phases[k].status === "passed");
-
-    const smokePassed = run.phases.smoketest.status === "passed";
-    const inspectorPassed = run.phases.inspector.status === "passed";
-
-    // Smoketest is advisory when both implementation AND QA passed independently.
-    // Rationale: if multiple QA agents verified the code, a smoketest false negative
-    // (e.g., generic endpoint probes) shouldn't override that verdict.
-    const smokeEffective = smokePassed || (implPassed && qaPassed);
-    if (!smokePassed && smokeEffective) {
-      console.log(`[${run.id}] Smoketest failed but overridden — implementation + QA both passed`);
-      run.phases.smoketest.overridden = true;
-      run.phases.smoketest.overrideReason = "Implementation and QA agents passed independently";
-    }
-
-    const allPassed =
-      run.phases.leader.status === "passed" &&
-      implPassed &&
-      smokeEffective &&
-      inspectorPassed;
-
-    run.status = allPassed ? "complete" : "failed";
-    run.results = {
-      leader: run.phases.leader.status,
-      implementation: implPassed ? "passed" : "failed",
-      qa: qaPassed ? "passed" : "failed",
-      smoketest: smokePassed ? "passed" : smokeEffective ? "overridden" : "failed",
-      inspector: run.phases.inspector.status,
-      feedbackLoops,
-      allPassed,
-    };
-    saveRun(run);
-
-    console.log(`[${run.id}] ═══ WORKFLOW ${run.status.toUpperCase()} ═══ leader=${run.results.leader} impl=${run.results.implementation} qa=${run.results.qa} smoke=${run.results.smoketest} inspect=${run.results.inspector} feedbackLoops=${feedbackLoops}`);
-
-    // ── Phase 6: Auto-restart app to serve latest code ──
-    if (implPassed) {
-      console.log(`[${run.id}] Restarting app with latest code...`);
-      const appResult = await startApp();
-      run.app = appResult;
-      saveRun(run);
-      if (appResult.running) {
-        console.log(`[${run.id}] App live: backend=${appResult.backend || "—"} frontend=${appResult.frontend || "—"}`);
-      }
-    }
-
-  } catch (err) {
-    console.error(`[${run.id}] Workflow error:`, err);
-    run.status = "failed";
-    run.results = { ...run.results, error: err.message, allPassed: false };
-    saveRun(run);
-  }
-}
-
-// ══════════════════════════════════════════════════════════════
-// App Launcher — starts the built app after successful pipeline
-// ══════════════════════════════════════════════════════════════
-
-const appProcesses = { backend: null, frontend: null };
-
-function killApp() {
-  for (const [name, proc] of Object.entries(appProcesses)) {
-    if (proc) {
-      console.log(`[app] Stopping ${name} (pid ${proc.pid})`);
-      try { process.kill(-proc.pid, "SIGKILL"); } catch {} // Kill process group
-      try { proc.kill("SIGKILL"); } catch {}
-      appProcesses[name] = null;
-    }
-  }
-}
-
-/**
- * Check if a port is in use by reading /proc/net/tcp6.
- */
-function isPortInUse(port) {
-  try {
-    const hex = port.toString(16).toUpperCase().padStart(4, "0");
-    const tcp6 = readFileSync("/proc/net/tcp6", "utf-8");
-    return tcp6.split("\n").some((line) => {
-      const cols = line.trim().split(/\s+/);
-      return cols[1] && cols[1].endsWith(`:${hex}`) && cols[3] === "0A";
-    });
-  } catch { return false; }
-}
-
-/**
- * Wait for a port to become free (max waitMs).
- */
-async function waitForPortFree(port, waitMs = 5000) {
-  const start = Date.now();
-  while (isPortInUse(port) && Date.now() - start < waitMs) {
-    await new Promise((r) => setTimeout(r, 500));
-  }
-  return !isPortInUse(port);
-}
-
-async function startApp() {
-  killApp(); // Stop tracked instances
-
-  // Wait for ports to actually free up (handles orphans from prior container lifecycle)
-  const ports = [3001, 5173];
-  for (const port of ports) {
-    if (isPortInUse(port)) {
-      console.log(`[app] Port ${port} still in use, waiting...`);
-      const freed = await waitForPortFree(port);
-      if (!freed) {
-        console.warn(`[app] Port ${port} still occupied — new process may fail`);
-      }
-    }
-  }
-
-  const result = { running: false, backend: null, frontend: null };
-  const backendDir = join(WORKSPACE, "Source/Backend");
-  const frontendDir = join(WORKSPACE, "Source/Frontend");
-
-  // ── Start backend ──
-  if (existsSync(join(backendDir, "package.json"))) {
-    const pkg = JSON.parse(readFileSync(join(backendDir, "package.json"), "utf-8"));
-
-    // Determine start command (try ts-node first, then compiled, then npm start)
-    let cmd, args;
-    if (existsSync(join(backendDir, "src/index.ts"))) {
-      cmd = "npx"; args = ["ts-node", "src/index.ts"];
-    } else if (existsSync(join(backendDir, "dist/index.js"))) {
-      cmd = "node"; args = ["dist/index.js"];
-    } else if (pkg.scripts && pkg.scripts.start) {
-      cmd = "npm"; args = ["start"];
-    }
-
-    if (cmd) {
-      console.log(`[app] Starting backend: ${cmd} ${args.join(" ")}`);
-      const proc = spawn(cmd, args, {
-        cwd: backendDir,
-        env: { ...process.env, PORT: "3001", NODE_ENV: "development", LOG_LEVEL: "info" },
-        stdio: ["ignore", "pipe", "pipe"],
-        detached: true,
-      });
-      appProcesses.backend = proc;
-      proc.stdout.on("data", (d) => {
-        for (const line of d.toString().split("\n")) {
-          if (line.trim()) process.stdout.write(`  [app:backend] ${line}\n`);
-        }
-      });
-      proc.stderr.on("data", (d) => {
-        for (const line of d.toString().split("\n")) {
-          if (line.trim()) process.stderr.write(`  [app:backend] ${line}\n`);
-        }
-      });
-      proc.on("exit", (code) => {
-        console.log(`[app] Backend exited (code ${code})`);
-        appProcesses.backend = null;
-      });
-
-      // Wait for backend to be ready
-      for (let i = 0; i < 30; i++) {
-        await new Promise((r) => setTimeout(r, 1000));
-        try {
-          const res = await fetch("http://localhost:3001");
-          if (res.ok || res.status < 500) { result.backend = "http://localhost:3001"; break; }
-        } catch {}
-      }
-    }
-  }
-
-  // ── Start frontend ──
-  if (existsSync(join(frontendDir, "package.json"))) {
-    console.log("[app] Starting frontend: vite");
-    const proc = spawn("npx", ["vite", "--host", "0.0.0.0", "--port", "5173"], {
-      cwd: frontendDir,
-      env: { ...process.env },
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: true,
-    });
-    appProcesses.frontend = proc;
-    proc.stdout.on("data", (d) => {
-      for (const line of d.toString().split("\n")) {
-        if (line.trim()) process.stdout.write(`  [app:frontend] ${line}\n`);
-      }
-    });
-    proc.stderr.on("data", (d) => {
-      for (const line of d.toString().split("\n")) {
-        if (line.trim()) process.stderr.write(`  [app:frontend] ${line}\n`);
-      }
-    });
-    proc.on("exit", (code) => {
-      console.log(`[app] Frontend exited (code ${code})`);
-      appProcesses.frontend = null;
-    });
-
-    for (let i = 0; i < 20; i++) {
-      await new Promise((r) => setTimeout(r, 1000));
-      try {
-        const res = await fetch("http://localhost:5173");
-        if (res.ok) { result.frontend = "http://localhost:5173"; break; }
-      } catch {}
-    }
-  }
-
-  result.running = !!(result.backend || result.frontend);
-  return result;
-}
-
-function getAppStatus() {
-  return {
-    backend: appProcesses.backend ? { pid: appProcesses.backend.pid, url: "http://localhost:3001" } : null,
-    frontend: appProcesses.frontend ? { pid: appProcesses.frontend.pid, url: "http://localhost:5173" } : null,
-    running: !!(appProcesses.backend || appProcesses.frontend),
-  };
-}
+// Workflow engine — initialized by Task 12 (container bootstrap).
+// Until then, POST /api/work returns 503.
+let workflowEngine = null;
 
 // ══════════════════════════════════════════════════════════════
 // API Endpoints
 // ══════════════════════════════════════════════════════════════
 
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", workspace: WORKSPACE, runs: listRuns().length, app: getAppStatus() });
-});
-
-// App management
-app.get("/api/app", (req, res) => {
-  res.json(getAppStatus());
-});
-
-app.post("/api/app/start", async (req, res) => {
-  const result = await startApp();
-  res.json(result);
-});
-
-app.post("/api/app/stop", (req, res) => {
-  killApp();
-  res.json({ stopped: true });
+  res.json({
+    status: "ok",
+    workspace: WORKSPACE,
+    runs: listRuns().length,
+    engineReady: !!workflowEngine,
+  });
 });
 
 app.post("/api/work", upload.array("images", 10), async (req, res) => {
+  if (!workflowEngine) {
+    return res.status(503).json({ error: "Orchestrator not initialized — Docker not available" });
+  }
+
   const { task, planFile, team: forceTeam } = req.body;
   if (!task) return res.status(400).json({ error: "Missing required field: task" });
 
@@ -767,7 +291,7 @@ app.post("/api/work", upload.array("images", 10), async (req, res) => {
       console.log(`[${run.id}] Team: ${team} — ${teamReason}`);
       saveRun(run);
 
-      await executeWorkflow(run);
+      await workflowEngine.executeWorkflow(run, saveRun);
     } catch (err) {
       console.error(`[${run.id}] Fatal:`, err);
       run.status = "failed";
@@ -891,20 +415,20 @@ app.get("/", (req, res) => {
     </tr>`;
   }).join("\n");
 
-  const appStatus = getAppStatus();
-  const appBanner = appStatus.running
-    ? `<div class="app-banner running">
-        <span>Built App Running:</span>
-        ${appStatus.backend ? `<a href="http://localhost:${process.env.APP_BACKEND_PORT || 4001}" target="_blank">Backend :${process.env.APP_BACKEND_PORT || 4001}</a>` : ""}
-        ${appStatus.frontend ? `<a href="http://localhost:${process.env.APP_FRONTEND_PORT || 4173}" target="_blank">Frontend :${process.env.APP_FRONTEND_PORT || 4173}</a>` : ""}
-        <button onclick="fetch('/api/app/stop',{method:'POST'}).then(()=>location.reload())" class="btn stop">Stop</button>
-      </div>`
-    : runs.some((r) => r.results?.allPassed || r.results?.implementation === "passed")
-      ? `<div class="app-banner stopped">
-          <span>App not running.</span>
-          <button onclick="fetch('/api/app/start',{method:'POST'}).then(()=>setTimeout(()=>location.reload(),5000))" class="btn start">Start App</button>
-        </div>`
-      : "";
+  // Engine status banner
+  const engineBanner = workflowEngine
+    ? '<div class="engine-banner ready"><span>Engine: Container Mode</span></div>'
+    : '<div class="engine-banner offline"><span>Engine: Not initialized (Docker unavailable)</span></div>';
+
+  // Active run app banners (apps running in worker containers)
+  const appBanners = runs
+    .filter((r) => r.app && r.app.running)
+    .map((r) => `<div class="app-banner running">
+      <span>App (${r.id.slice(-12)}):</span>
+      ${r.app.backend ? `<a href="${r.app.backend}" target="_blank">Backend ${r.app.backend}</a>` : ""}
+      ${r.app.frontend ? `<a href="${r.app.frontend}" target="_blank">Frontend ${r.app.frontend}</a>` : ""}
+    </div>`)
+    .join("\n");
 
   res.send(`<!DOCTYPE html>
 <html><head><title>claude-ai-OS Pipeline</title>
@@ -919,20 +443,20 @@ app.get("/", (req, res) => {
   a { color: #6366f1; text-decoration: none; }
   a:hover { text-decoration: underline; }
   .empty { color: #7b7f9e; padding: 2rem; text-align: center; }
-  .app-banner { padding: 0.75rem 1rem; border-radius: 8px; margin-bottom: 1rem; display: flex; align-items: center; gap: 1rem; font-size: 0.9rem; }
+  .engine-banner { padding: 0.5rem 1rem; border-radius: 8px; margin-bottom: 0.5rem; font-size: 0.8rem; }
+  .engine-banner.ready { background: #052e16; border: 1px solid #22c55e; color: #22c55e; }
+  .engine-banner.offline { background: #1a1d27; border: 1px solid #7b7f9e; color: #7b7f9e; }
+  .app-banner { padding: 0.75rem 1rem; border-radius: 8px; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 1rem; font-size: 0.9rem; }
   .app-banner.running { background: #052e16; border: 1px solid #22c55e; }
-  .app-banner.stopped { background: #1a1d27; border: 1px solid #2a2d3e; }
   .app-banner a { color: #22c55e; font-weight: 600; }
-  .btn { padding: 0.3rem 0.75rem; border: none; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
-  .btn.stop { background: #ef4444; color: white; }
-  .btn.start { background: #22c55e; color: #0f1117; font-weight: 600; }
   .legend { display: flex; gap: 1rem; flex-wrap: wrap; margin: 1rem 0; font-size: 0.75rem; }
   .legend span { display: flex; align-items: center; gap: 0.25rem; }
   .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
 </style></head><body>
 <h1>claude-ai-OS Pipeline</h1>
-<p class="subtitle">Multi-stage dispatch: Leader → Parse → Code → QA (feedback loops) → Validate. Auto-refreshes 10s.</p>
-${appBanner}
+<p class="subtitle">Container-based dispatch: Leader -> Parse -> Code -> QA (feedback loops) -> Validate. Auto-refreshes 10s.</p>
+${engineBanner}
+${appBanners}
 <div class="legend">
   <span><span class="dot" style="background:#7b7f9e"></span> Routing</span>
   <span><span class="dot" style="background:#fb923c"></span> Planning</span>
@@ -955,37 +479,13 @@ ${runs.length === 0 ? '<p class="empty">No runs yet. POST to <code>/api/work</co
 // Start
 // ══════════════════════════════════════════════════════════════
 
-app.listen(PORT, "0.0.0.0", async () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`claude-ai-OS orchestrator listening on :${PORT}`);
   console.log(`  Dashboard:  http://localhost:${PORT}`);
   console.log(`  Submit:     POST http://localhost:${PORT}/api/work`);
   console.log(`  Workspace:  ${WORKSPACE}`);
-  console.log(`  Dispatch:   multi-stage with ${MAX_FEEDBACK_LOOPS} feedback loops`);
-
-  // Docker API connectivity check (temporary — will move to proper module)
-  try {
-    const Docker = require("dockerode");
-    const docker = new Docker({ socketPath: "/var/run/docker.sock" });
-    await docker.ping();
-    console.log("[docker] Docker API connected");
-  } catch (err) {
-    console.log("[docker] Docker socket not available — parallel cycles disabled");
-  }
-
-  // Auto-start app if Source/ exists from a previous pipeline run
-  const hasBackend = existsSync(join(WORKSPACE, "Source/Backend/package.json"));
-  const hasFrontend = existsSync(join(WORKSPACE, "Source/Frontend/package.json"));
-  if (hasBackend || hasFrontend) {
-    console.log("[boot] Found existing app — auto-starting...");
-    try {
-      const result = await startApp();
-      if (result.running) {
-        console.log(`[boot] App ready: backend=${result.backend || "—"} frontend=${result.frontend || "—"}`);
-      } else {
-        console.log("[boot] App failed to start (check logs above)");
-      }
-    } catch (err) {
-      console.error("[boot] Auto-start failed:", err.message);
-    }
-  }
+  console.log(`  Engine:     ${workflowEngine ? "container mode" : "not initialized (Task 12 wires it up)"}`);
 });
+
+// Export for Task 12 integration — allows setting the engine after Docker init
+module.exports = { app, setWorkflowEngine: (engine) => { workflowEngine = engine; } };
