@@ -28,8 +28,9 @@ RUN npm install -g @anthropic-ai/claude-code
 # Working directory
 WORKDIR /workspace
 
-# Copy scripts
-COPY scripts/ /app/scripts/
+# Copy scripts and templates
+COPY docker/scripts/ /app/scripts/
+COPY templates/ /app/templates/
 RUN chmod +x /app/scripts/*.sh
 
 # Default: idle (orchestrator sends work via exec)

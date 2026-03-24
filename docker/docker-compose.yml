@@ -73,8 +73,8 @@ services:
   # ════════════════════════════════════════════
   setup:
     build:
-      context: .
-      dockerfile: Dockerfile.worker
+      context: ..
+      dockerfile: docker/Dockerfile.worker
     entrypoint: ["/bin/bash", "/app/scripts/setup-workspace.sh"]
     environment:
       - GITHUB_REPO=${GITHUB_REPO:-https://github.com/your-org/your-project.git}
@@ -85,7 +85,6 @@ services:
       - workspace:/workspace
       - claude-config:/root/.claude
       - ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro  # Live token from host
-      - ../templates:/app/templates:ro
     networks:
       - claude-net
 
@@ -95,8 +94,8 @@ services:
   # ════════════════════════════════════════════
   worker:
     build:
-      context: .
-      dockerfile: Dockerfile.worker
+      context: ..
+      dockerfile: docker/Dockerfile.worker
     environment:
       - WORKSPACE_DIR=/workspace
       # Model selection is defined per-agent in Teams/*.md role files

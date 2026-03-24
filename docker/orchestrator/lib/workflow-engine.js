@@ -260,6 +260,34 @@ ${feedback}`;
       console.log(`[${run.id}] Initializing workspace in worker...`);
       await this.containerManager.initWorkspace(containerId, run.id);
 
+      // ── Phase 0c: Copy image attachments into worker ──
+      if (run.attachments && run.attachments.length > 0) {
+        console.log(`[${run.id}] Copying ${run.attachments.length} image(s) into worker...`);
+        for (const attachPath of run.attachments) {
+          try {
+            const { readFileSync } = require("fs");
+            const { basename } = require("path");
+            const data = readFileSync(attachPath);
+            const fileName = basename(attachPath);
+            const workerDir = `/workspace/.attachments`;
+            // Create dir and write file via base64 to avoid shell escaping issues
+            const b64 = data.toString("base64");
+            await this.containerManager.execInWorker(
+              containerId, "bash", ["-c",
+                `mkdir -p ${workerDir} && echo '${b64}' | base64 -d > ${workerDir}/${fileName}`
+              ],
+              { label: "attach", quiet: true }
+            );
+            // Update attachment path to worker-side path
+            run.attachments[run.attachments.indexOf(attachPath)] = `${workerDir}/${fileName}`;
+          } catch (err) {
+            console.warn(`[${run.id}] Failed to copy attachment: ${err.message}`);
+          }
+        }
+        // Rebuild image context with worker-side paths
+        saveRunFn(run);
+      }
+
       // ── Phase 1: Team leader produces plan ──
       run.status = "planning";
       run.phases = { leader: { status: "running", startedAt: ts() } };

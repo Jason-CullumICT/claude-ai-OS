@@ -28,6 +28,36 @@ fi
 
 cd "$WORKSPACE"
 
+# ── Bootstrap with claude-ai-OS templates if Teams/ doesn't exist ────────────
+TEMPLATE_DIR="/app/templates"
+if [ ! -d "$WORKSPACE/Teams" ] && [ -d "$TEMPLATE_DIR/Teams" ]; then
+  echo "[setup] Bootstrapping with claude-ai-OS framework templates..."
+  cp -r "$TEMPLATE_DIR/Teams" "$WORKSPACE/Teams"
+  [ -d "$TEMPLATE_DIR/Plans" ] && [ ! -d "$WORKSPACE/Plans" ] && cp -r "$TEMPLATE_DIR/Plans" "$WORKSPACE/Plans"
+  mkdir -p "$WORKSPACE/tools"
+  [ -d "$TEMPLATE_DIR/tools" ] && cp -r "$TEMPLATE_DIR/tools/"* "$WORKSPACE/tools/" 2>/dev/null || true
+  if [ ! -f "$WORKSPACE/CLAUDE.md" ] && [ -f "$TEMPLATE_DIR/CLAUDE.md.template" ]; then
+    cp "$TEMPLATE_DIR/CLAUDE.md.template" "$WORKSPACE/CLAUDE.md"
+    PNAME="${PROJECT_NAME:-my-project}"
+    sed -i "s|{{PROJECT_NAME}}|${PNAME}|g" "$WORKSPACE/CLAUDE.md"
+    sed -i "s|{{PROJECT_DESCRIPTION}}|AI-managed project. Update this description in CLAUDE.md.|g" "$WORKSPACE/CLAUDE.md"
+    sed -i "s|{{SPECS_DIR}}|Specifications|g" "$WORKSPACE/CLAUDE.md"
+    sed -i "s|{{PLANS_DIR}}|Plans|g" "$WORKSPACE/CLAUDE.md"
+    sed -i "s|{{BACKEND_URL}}|http://localhost:3001|g" "$WORKSPACE/CLAUDE.md"
+    sed -i "s|{{FRONTEND_URL}}|http://localhost:5173|g" "$WORKSPACE/CLAUDE.md"
+    sed -i "s|{{LOGIN_CREDENTIALS}}|admin@example.com / admin123|g" "$WORKSPACE/CLAUDE.md"
+    sed -i "s|{{SOURCE_LAYOUT}}|Source/                  # Application source code|g" "$WORKSPACE/CLAUDE.md"
+    sed -i "s|{{DOMAIN_CONCEPTS}}|<!-- Define your domain entities here. -->|g" "$WORKSPACE/CLAUDE.md"
+    sed -i "s|{{BUILD_COMMANDS}}|# Add your build and test commands here|g" "$WORKSPACE/CLAUDE.md"
+    sed -i "s|{{VERIFICATION_GATES}}|# Add your test commands here|g" "$WORKSPACE/CLAUDE.md"
+  fi
+  # Commit bootstrapped files before creating cycle branch
+  git add -A
+  git commit -m "chore: bootstrap with claude-ai-OS framework" || true
+  git push origin "$GITHUB_BRANCH" || true
+  echo "[setup] Framework bootstrapped"
+fi
+
 # ── Delete stale remote branch if it exists ──────────────────────────────────
 git push origin --delete "cycle/$RUN_ID" 2>/dev/null || true
 
