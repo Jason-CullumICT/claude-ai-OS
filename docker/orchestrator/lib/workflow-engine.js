@@ -461,6 +461,34 @@ ${feedback}`;
 
       run.feedbackLoops = feedbackLoops;
 
+      // ── Phase 3.5: Start app BEFORE validation ──
+      // Dynamic-first agents (chaos-monkey, performance-profiler, red-teamer)
+      // check service health and run real tests when the app is alive.
+      // Without this, they always fall back to static-only analysis.
+      console.log(`[${run.id}] Phase 3.5: Starting app for dynamic testing...`);
+      try {
+        const appResult = await this.containerManager.startApp(containerId);
+        run.app = {
+          running: appResult.backend || appResult.frontend,
+          backend: appResult.backend ? `http://localhost:${run.ports.backend}` : null,
+          frontend: appResult.frontend ? `http://localhost:${run.ports.frontend}` : null,
+        };
+        saveRunFn(run);
+
+        if (run.app.running) {
+          console.log(`[${run.id}] App running for dynamic tests: backend=${run.app.backend || "--"} frontend=${run.app.frontend || "--"}`);
+          // Give the app a moment to fully initialize (DB migrations, etc.)
+          await new Promise((r) => setTimeout(r, 3000));
+        } else {
+          console.log(`[${run.id}] App failed to start — agents will use static fallback`);
+        }
+      } catch (err) {
+        console.warn(`[${run.id}] App start failed (${err.message}) — agents will use static fallback`);
+        run.app = { running: false, backend: null, frontend: null };
+      }
+
+      this.registry.update(run.id, { appRunning: !!run.app?.running });
+
       // ── Phase 4: Final validation (smoketest + inspector in parallel, in worker) ──
       run.status = "validating";
       run.phases.smoketest = { status: "running", startedAt: ts() };
@@ -542,23 +570,10 @@ ${feedback}`;
 
       console.log(`[${run.id}] === WORKFLOW ${run.status.toUpperCase()} === leader=${run.results.leader} impl=${run.results.implementation} qa=${run.results.qa} smoke=${run.results.smoketest} inspect=${run.results.inspector} feedbackLoops=${feedbackLoops}`);
 
-      // ── Phase 6: Start app in worker (port-mapped to host) ──
-      if (implPassed) {
-        console.log(`[${run.id}] Starting app in worker container...`);
-        const appResult = await this.containerManager.startApp(containerId);
-        run.app = {
-          running: appResult.backend || appResult.frontend,
-          backend: appResult.backend ? `http://localhost:${run.ports.backend}` : null,
-          frontend: appResult.frontend ? `http://localhost:${run.ports.frontend}` : null,
-        };
-        saveRunFn(run);
+      // App is already running from Phase 3.5 — no need to start again.
+      // It stays running on the worker's allocated ports for user testing.
 
-        if (run.app.running) {
-          console.log(`[${run.id}] App live: backend=${run.app.backend || "--"} frontend=${run.app.frontend || "--"}`);
-        }
-      }
-
-      // ── Phase 7: Commit and push from worker ──
+      // ── Phase 6: Commit and push from worker ──
       console.log(`[${run.id}] Committing and pushing...`);
       const commitMsg = `feat: ${run.task.slice(0, 100)}`;
       await this.containerManager.commitAndPush(containerId, run.id, commitMsg);
