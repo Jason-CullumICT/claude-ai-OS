@@ -697,6 +697,55 @@ app.listen(config.port, "0.0.0.0", async () => {
   } else {
     console.warn("[boot] Docker not available — submit /api/work will return 503");
   }
+
+  // Auto-start feature portal from main workspace if Source/ exists
+  const backendPkg = join(config.workspace, "Source/Backend/package.json");
+  const frontendPkg = join(config.workspace, "Source/Frontend/package.json");
+  if (existsSync(backendPkg) || existsSync(frontendPkg)) {
+    console.log("[portal] Starting feature portal from main workspace...");
+    try {
+      if (existsSync(backendPkg)) {
+        const backendDir = join(config.workspace, "Source/Backend");
+        const bp = spawn("npx", ["ts-node", "src/index.ts"], {
+          cwd: backendDir,
+          env: { ...process.env, PORT: "3001", NODE_ENV: "development" },
+          stdio: ["ignore", "pipe", "pipe"],
+          detached: true,
+        });
+        bp.stdout.on("data", (d) => {
+          for (const line of d.toString().split("\n")) {
+            if (line.trim()) process.stdout.write(`  [portal:backend] ${line}\n`);
+          }
+        });
+        bp.stderr.on("data", (d) => {
+          for (const line of d.toString().split("\n")) {
+            if (line.trim()) process.stderr.write(`  [portal:backend] ${line}\n`);
+          }
+        });
+        bp.on("exit", (code) => console.log(`[portal] Backend exited (${code})`));
+        bp.unref();
+      }
+      if (existsSync(frontendPkg)) {
+        const frontendDir = join(config.workspace, "Source/Frontend");
+        const fp = spawn("npx", ["vite", "--host", "0.0.0.0", "--port", "5173"], {
+          cwd: frontendDir,
+          env: { ...process.env },
+          stdio: ["ignore", "pipe", "pipe"],
+          detached: true,
+        });
+        fp.stdout.on("data", (d) => {
+          for (const line of d.toString().split("\n")) {
+            if (line.trim()) process.stdout.write(`  [portal:frontend] ${line}\n`);
+          }
+        });
+        fp.on("exit", (code) => console.log(`[portal] Frontend exited (${code})`));
+        fp.unref();
+      }
+      console.log("[portal] Feature portal starting on :3001 (backend) :5173 (frontend)");
+    } catch (err) {
+      console.warn(`[portal] Auto-start failed: ${err.message}`);
+    }
+  }
 });
 
 // ══════════════════════════════════════════════════════════════
