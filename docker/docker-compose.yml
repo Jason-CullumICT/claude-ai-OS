@@ -1,0 +1,147 @@
+##############################################################################
+# claude-ai-OS — Docker Compose
+#
+# Runs Claude Code agent teams in containers with an orchestrator that
+# decides team routing, executes work, and runs parallel post-validation.
+#
+# Usage:
+#   cp .env.example .env          # Fill in your keys
+#   docker compose up -d
+#   curl http://localhost:8080/api/work -d '{"task": "Fix login bug", "plan": "Plans/auth-fix/plan.md"}'
+#
+# Architecture:
+#   ┌────────────────┐     ┌─────────────────┐
+#   │  External      │────▶│  Orchestrator    │──── Port 8080 (API + Dashboard)
+#   │  Trigger       │     │  (decides team)  │
+#   └────────────────┘     └────────┬────────┘
+#                                   │
+#                    ┌──────────────┼──────────────┐
+#                    ▼              ▼              ▼
+#              ┌──────────┐  ┌──────────┐  ┌──────────┐
+#              │ Worker 1 │  │ Worker 2 │  │ Worker 3 │
+#              │ (team)   │  │ (inspect)│  │ (smoke)  │
+#              └──────────┘  └──────────┘  └──────────┘
+#                    │              │              │
+#                    └──────────────┼──────────────┘
+#                                   ▼
+#                          Shared: /workspace
+#                          (cloned project repo)
+##############################################################################
+
+services:
+
+  # ════════════════════════════════════════════
+  # Orchestrator — API endpoint + team router
+  # ════════════════════════════════════════════
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.orchestrator
+    ports:
+      - "${DASHBOARD_PORT:-8080}:8080"     # API + Pipeline dashboard
+      - "${APP_BACKEND_PORT:-4001}:3001"   # Built app backend (host:4001 → container:3001)
+      - "${APP_FRONTEND_PORT:-4173}:5173"  # Built app frontend (host:4173 → container:5173)
+    environment:
+      - GITHUB_REPO=${GITHUB_REPO:-https://github.com/your-org/your-project.git}
+      - GITHUB_BRANCH=${GITHUB_BRANCH:-main}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - PROJECT_NAME=${PROJECT_NAME:-my-project}
+      - WORKSPACE_DIR=/workspace
+      # Model selection is defined per-agent in Teams/*.md role files
+    volumes:
+      - workspace:/workspace
+      - claude-config:/root/.claude
+      - ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro  # Live token from host
+      - pipeline-state:/workspace/tools
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks:
+      - claude-net
+
+  # ════════════════════════════════════════════
+  # Setup — clones repo + installs deps (init container)
+  # ════════════════════════════════════════════
+  setup:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    entrypoint: ["/bin/bash", "/app/scripts/setup-workspace.sh"]
+    environment:
+      - GITHUB_REPO=${GITHUB_REPO:-https://github.com/your-org/your-project.git}
+      - GITHUB_BRANCH=${GITHUB_BRANCH:-main}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - PROJECT_NAME=${PROJECT_NAME:-my-project}
+    volumes:
+      - workspace:/workspace
+      - claude-config:/root/.claude
+      - ~/.claude/.credentials.json:/root/.claude/.credentials.json:ro  # Live token from host
+      - ../templates:/app/templates:ro
+    networks:
+      - claude-net
+
+  # ════════════════════════════════════════════
+  # Worker — runs Claude Code team sessions
+  # Scaled dynamically by orchestrator
+  # ════════════════════════════════════════════
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    environment:
+      - CLAUDE_SESSION_TOKEN=${CLAUDE_SESSION_TOKEN}
+      - WORKSPACE_DIR=/workspace
+      # Model selection is defined per-agent in Teams/*.md role files
+    volumes:
+      - workspace:/workspace
+      - claude-config:/root/.claude
+      - pipeline-state:/workspace/tools
+    deploy:
+      replicas: 0   # Scaled up by orchestrator on demand
+    networks:
+      - claude-net
+
+  # ════════════════════════════════════════════
+  # Playwright — headless smoke tests
+  # ════════════════════════════════════════════
+  playwright:
+    build:
+      context: .
+      dockerfile: Dockerfile.playwright
+    environment:
+      - BASE_URL=${SMOKE_TEST_URL:-http://host.docker.internal:5173}
+      - WORKSPACE_DIR=/workspace
+    volumes:
+      - workspace:/workspace
+      - test-results:/workspace/Source/E2E/test-results
+    deploy:
+      replicas: 0   # Started by orchestrator after team completion
+    networks:
+      - claude-net
+
+  # ════════════════════════════════════════════
+  # Dashboard — static file server for reports
+  # ════════════════════════════════════════════
+  dashboard:
+    image: nginx:alpine
+    ports:
+      - "${REPORT_PORT:-8081}:80"
+    volumes:
+      - workspace:/usr/share/nginx/html/workspace:ro
+      - pipeline-state:/usr/share/nginx/html/pipeline:ro
+      - test-results:/usr/share/nginx/html/test-results:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - claude-net
+    restart: unless-stopped
+
+volumes:
+  workspace:       # Cloned project repo
+  claude-config:   # Claude Code auth + settings
+  pipeline-state:  # Pipeline JSON state files
+  test-results:    # Playwright test results + reports
+
+networks:
+  claude-net:
+    driver: bridge

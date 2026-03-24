@@ -1,0 +1,28 @@
+########################################################################
+# Orchestrator — API server that routes work to Claude Code workers
+########################################################################
+FROM node:22-slim
+
+ENV CLAUDE_NONINTERACTIVE=1
+
+RUN apt-get update && apt-get install -y \
+    curl git jq python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Claude Code (for direct session execution)
+RUN npm install -g @anthropic-ai/claude-code
+
+WORKDIR /app
+
+# Install orchestrator deps
+COPY orchestrator/package.json orchestrator/package-lock.json* ./
+RUN npm install --production
+
+# Copy orchestrator code
+COPY orchestrator/ ./
+COPY scripts/ /app/scripts/
+RUN chmod +x /app/scripts/*.sh
+
+EXPOSE 8080
+
+CMD ["node", "server.js"]

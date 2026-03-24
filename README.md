@@ -13,13 +13,46 @@ A framework for bootstrapping AI-assisted software development projects with Lev
 
 ## Quick Start
 
+### 1. Install Claude Code environment
+
 ```bash
 git clone https://github.com/your-org/claude-ai-OS.git
 cd claude-ai-OS
+
+# Bash (Linux/macOS/Git Bash on Windows):
+bash install.sh
+
+# PowerShell (Windows):
+.\install.ps1
+```
+
+This configures Claude Code globally: plugins, permissions, status line, VoltAgent subagents.
+
+### 2. Bootstrap a project
+
+```bash
+# Bash:
 ./setup.sh /path/to/my-project --name "My Project"
+
+# PowerShell:
+.\setup.ps1 C:\path\to\my-project -Name "My Project"
 ```
 
 This copies the template structure into your project directory, customizes placeholders, and sets up the agent teams.
+
+### 3. Run a team
+
+Open a **dedicated Claude Code session** in your project:
+```bash
+cd /path/to/my-project
+claude
+```
+Then paste:
+```
+Read Teams/TheATeam/team-leader.md and follow it exactly.
+Task: implement <your feature>. Plan file: Plans/<plan>.md
+```
+The session runs the full pipeline — requirements, contracts, coders, QA — autonomously.
 
 ## What Gets Created
 

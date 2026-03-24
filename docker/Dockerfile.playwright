@@ -1,0 +1,9 @@
+########################################################################
+# Playwright — headless smoke tests
+########################################################################
+FROM mcr.microsoft.com/playwright:v1.50.0-noble
+
+WORKDIR /workspace/Source/E2E
+
+# Default: run smoke tests then exit
+CMD ["npx", "playwright", "test", "--config=playwright.smoke.config.ts", "--workers=2"]
