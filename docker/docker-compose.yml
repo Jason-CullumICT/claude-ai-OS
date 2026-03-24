@@ -39,6 +39,8 @@ services:
       dockerfile: Dockerfile.orchestrator
     ports:
       - "${DASHBOARD_PORT:-8080}:8080"     # API + Pipeline dashboard
+      - "${PORTAL_BACKEND_PORT:-4001}:3001"  # Feature portal backend (main workspace)
+      - "${PORTAL_FRONTEND_PORT:-4173}:5173" # Feature portal frontend (main workspace)
     environment:
       - GITHUB_REPO=${GITHUB_REPO:-https://github.com/your-org/your-project.git}
       - GITHUB_BRANCH=${GITHUB_BRANCH:-main}

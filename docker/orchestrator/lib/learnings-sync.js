@@ -1,10 +1,10 @@
 const { execFileSync } = require("child_process");
-const { existsSync, mkdirSync, rmSync } = require("fs");
 const config = require("./config");
 
 class LearningsSync {
   constructor() {
-    this.mergeDir = `${config.workspace}/.learnings-merge`;
+    // Use the orchestrator's own workspace — it's already on the main branch
+    this.repoDir = config.workspace;
     this.locked = false;
     this.lockTimer = null;
     this.lockTimeout = 60000;
@@ -35,46 +35,29 @@ class LearningsSync {
     }
   }
 
-  _git(args, cwd) {
+  _git(args) {
     return execFileSync("git", args, {
-      cwd: cwd || this.mergeDir,
+      cwd: this.repoDir,
       timeout: 30000,
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
     });
   }
 
-  _ensureWorktree() {
-    if (!existsSync(this.mergeDir)) {
-      console.log("[learnings] Creating merge worktree...");
-      this._git(["worktree", "add", this.mergeDir, "main"], config.workspace);
-    }
-  }
-
-  _destroyWorktree() {
-    try {
-      if (existsSync(this.mergeDir)) {
-        rmSync(this.mergeDir, { recursive: true, force: true });
-      }
-      this._git(["worktree", "prune"], config.workspace);
-    } catch {}
-  }
-
   async syncLearnings(runId, branch) {
     await this.acquireLock();
-    console.log(`[learnings] Syncing learnings from ${branch} to main...`);
+    const mainBranch = config.githubBranch;
+    console.log(`[learnings] Syncing learnings from ${branch} to ${mainBranch}...`);
 
     try {
-      this._ensureWorktree();
-
-      // Update main
-      this._git(["checkout", "main"]);
-      this._git(["pull", "origin", "main"]);
+      // Ensure we're on the main branch and up to date
+      this._git(["checkout", mainBranch]);
+      this._git(["pull", "origin", mainBranch]);
 
       // Fetch the cycle branch
       this._git(["fetch", "origin", branch]);
 
-      // Cherry-pick learnings files
+      // Cherry-pick learnings files from the cycle branch
       let hasChanges = false;
       const filePatterns = [
         "Teams/*/learnings/*.md",
@@ -96,18 +79,25 @@ class LearningsSync {
         this._git(["checkout", `origin/${branch}`, "--", "CLAUDE.md"]);
         hasChanges = true;
       } catch {
-        console.log("[learnings] CLAUDE.md conflict — skipping (will be in PR)");
+        console.log("[learnings] CLAUDE.md conflict or unchanged — skipping");
       }
 
       if (hasChanges) {
         try {
           this._git(["add", "-A"]);
-          this._git(["commit", "-m", `chore: sync learnings from cycle/${runId}`]);
-          this._git(["push", "origin", "main"]);
-          console.log(`[learnings] Learnings merged to main from ${branch}`);
+          // Check if there's actually anything to commit
+          try {
+            this._git(["diff", "--cached", "--quiet"]);
+            // No diff = nothing to commit
+            console.log("[learnings] No new learnings changes to sync");
+          } catch {
+            // diff --quiet exits non-zero when there ARE changes
+            this._git(["commit", "-m", `chore: sync learnings from cycle/${runId}`]);
+            this._git(["push", "origin", mainBranch]);
+            console.log(`[learnings] Learnings merged to ${mainBranch} from ${branch}`);
+          }
         } catch (err) {
-          // Nothing to commit
-          console.log("[learnings] No learnings changes to sync");
+          console.warn(`[learnings] Commit/push failed: ${err.message}`);
         }
       } else {
         console.log("[learnings] No learnings files found in cycle branch");
@@ -117,14 +107,16 @@ class LearningsSync {
       return { success: true };
     } catch (err) {
       console.error(`[learnings] Sync failed: ${err.message}`);
-      this._destroyWorktree();
+      // Reset any partial checkout state
+      try { this._git(["checkout", mainBranch]); } catch {}
+      try { this._git(["reset", "--hard", `origin/${mainBranch}`]); } catch {}
       this.releaseLock();
       return { success: false, error: err.message };
     }
   }
 
   cleanup() {
-    this._destroyWorktree();
+    // No worktree to clean up — using the main workspace directly
   }
 }
 

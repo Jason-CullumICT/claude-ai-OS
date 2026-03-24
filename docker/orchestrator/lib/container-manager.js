@@ -10,6 +10,10 @@ class ContainerManager {
   }
 
   async ensureWorkerImage(forceRebuild = false) {
+    // Discover compose-prefixed resource names on first call
+    await this._findClaudeConfigVolume();
+    await this._findNetwork();
+
     const exists = await this.docker.imageExists(config.workerImage);
     if (exists && !forceRebuild) {
       console.log(`[container] Worker image ${config.workerImage} ready`);
@@ -20,15 +24,70 @@ class ContainerManager {
     console.log(`[container] Run: docker build -t ${config.workerImage} -f Dockerfile.worker .`);
   }
 
+  async _cleanOrphanedWorkers() {
+    // Find worker containers that exist in Docker but aren't tracked by the port allocator
+    try {
+      const containers = await this.docker.listContainers({
+        filters: { name: ["claude-worker-"] },
+      });
+      for (const c of containers) {
+        const name = (c.Names[0] || "").replace("/", "");
+        // Extract run ID from container name: claude-worker-{runId}
+        const runId = name.replace("claude-worker-", "");
+        if (runId && !this.ports.allocated.has(runId)) {
+          console.log(`[container] Cleaning orphaned worker: ${name}`);
+          await this.docker.removeContainer(c.Id);
+        }
+      }
+    } catch (err) {
+      console.warn(`[container] Orphan cleanup failed: ${err.message}`);
+    }
+  }
+
+  async _findClaudeConfigVolume() {
+    if (this._claudeConfigVolume) return;
+    try {
+      const volumes = await this.docker.docker.listVolumes();
+      const match = (volumes.Volumes || []).find((v) => v.Name.includes("claude-config"));
+      if (match) this._claudeConfigVolume = match.Name;
+    } catch {}
+    if (!this._claudeConfigVolume) this._claudeConfigVolume = "docker_claude-config";
+    console.log(`[container] Claude config volume: ${this._claudeConfigVolume}`);
+  }
+
+  async _findNetwork() {
+    // Docker Compose prepends project name to networks (e.g., "docker_claude-net")
+    // Discover the actual network name dynamically
+    if (this._networkName) return this._networkName;
+    try {
+      const networks = await this.docker.docker.listNetworks();
+      const match = networks.find((n) => n.Name.includes("claude-net"));
+      if (match) {
+        this._networkName = match.Name;
+        return this._networkName;
+      }
+    } catch {}
+    // Fallback: try common patterns
+    this._networkName = "docker_claude-net";
+    return this._networkName;
+  }
+
   async spawnWorker(runId) {
+    // Clean up any orphaned worker containers holding ports before allocating
+    await this._cleanOrphanedWorkers();
+
     const ports = this.ports.allocate(runId);
     if (!ports) throw new Error("No ports available — all slots allocated");
 
     const token = this.tokens.getTokenForWorker(runId);
     const containerName = `claude-worker-${runId}`;
     const volumeName = `workspace-${runId}`;
+    const networkName = await this._findNetwork();
 
-    console.log(`[container] Spawning ${containerName} (backend:${ports.backend} frontend:${ports.frontend})`);
+    console.log(`[container] Spawning ${containerName} (backend:${ports.backend} frontend:${ports.frontend} network:${networkName})`);
+
+    // Remove any existing container with the same name (stale from previous failed run)
+    try { await this.docker.removeContainer(containerName); } catch {}
 
     await this.docker.createVolume(volumeName);
 
@@ -49,7 +108,9 @@ class ContainerManager {
       HostConfig: {
         Binds: [
           `${volumeName}:/workspace`,
-          ...(token.available ? [`${token.mountPath}:/root/.claude/.credentials.json:ro`] : []),
+          // Mount the same claude-config volume the orchestrator uses
+          // Docker Compose prefixes volume names with project name (e.g., docker_claude-config)
+          `${this._claudeConfigVolume || "docker_claude-config"}:/root/.claude:ro`,
         ],
         PortBindings: {
           "3001/tcp": [{ HostPort: String(ports.backend) }],
@@ -62,12 +123,22 @@ class ContainerManager {
       },
       NetworkingConfig: {
         EndpointsConfig: {
-          "claude-net": {},
+          [networkName]: {},
         },
       },
     });
 
-    await this.docker.startContainer(container.id);
+    try {
+      await this.docker.startContainer(container.id);
+    } catch (err) {
+      // Start failed (e.g., port conflict) — clean up the created container
+      console.error(`[container] ${containerName} failed to start: ${err.message}`);
+      await this.docker.removeContainer(container.id);
+      await this.docker.removeVolume(volumeName);
+      this.ports.release(runId);
+      throw err;
+    }
+
     console.log(`[container] ${containerName} started (id: ${container.id.slice(0, 12)})`);
 
     return {
