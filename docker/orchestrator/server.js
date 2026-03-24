@@ -14,6 +14,12 @@
  *   GET  /api/runs              — list all runs
  *   GET  /api/runs/:id          — get run status (includes per-agent detail)
  *   POST /api/runs/:id/revalidate — re-run validation phase
+ *   GET  /api/cycles            — list active cycles
+ *   GET  /api/cycles/:id        — cycle detail
+ *   POST /api/cycles/:id/stop   — stop a running cycle
+ *   POST /api/cycles/:id/cleanup — remove volume + branch + container
+ *   GET  /api/cycles/:id/logs   — SSE streaming container logs
+ *   POST /api/worker-image/rebuild — rebuild worker Docker image
  *   GET  /api/health            — health check
  *   GET  /                      — live dashboard
  */
@@ -24,8 +30,33 @@ const { spawn } = require("child_process");
 const { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } = require("fs");
 const { join } = require("path");
 const { randomUUID } = require("crypto");
-const { createDispatcher } = require("./lib/dispatch");
+
+// ══════════════════════════════════════════════════════════════
+// Lib Modules
+// ══════════════════════════════════════════════════════════════
+
+const config = require("./lib/config");
+const { DockerClient } = require("./lib/docker-client");
+const { PortAllocator } = require("./lib/port-allocator");
+const { CycleRegistry } = require("./lib/cycle-registry");
+const { TokenPool } = require("./lib/token-pool");
+const { ContainerManager } = require("./lib/container-manager");
+const { LearningsSync } = require("./lib/learnings-sync");
+const { HealthMonitor } = require("./lib/health-monitor");
 const { WorkflowEngine } = require("./lib/workflow-engine");
+const { createDispatcher } = require("./lib/dispatch");
+
+const dockerClient = new DockerClient();
+const portAllocator = new PortAllocator();
+const cycleRegistry = new CycleRegistry();
+const tokenPool = new TokenPool();
+const containerManager = new ContainerManager(dockerClient, portAllocator, tokenPool);
+const learningsSync = new LearningsSync();
+const healthMonitor = new HealthMonitor(dockerClient, cycleRegistry, portAllocator);
+
+// ══════════════════════════════════════════════════════════════
+// Express Setup
+// ══════════════════════════════════════════════════════════════
 
 const app = express();
 app.use(express.json({ limit: "50mb" }));
@@ -40,10 +71,12 @@ const upload = multer({
   },
 });
 
-const PORT = 8080;
-const WORKSPACE = process.env.WORKSPACE_DIR || "/workspace";
-const RUNS_DIR = join(WORKSPACE, ".orchestrator-runs");
+const RUNS_DIR = join(config.workspace, ".orchestrator-runs");
 if (!existsSync(RUNS_DIR)) mkdirSync(RUNS_DIR, { recursive: true });
+
+// Workflow engine — initialized in app.listen after Docker init
+let workflowEngine = null;
+function setWorkflowEngine(engine) { workflowEngine = engine; }
 
 // ══════════════════════════════════════════════════════════════
 // Run State
@@ -127,8 +160,8 @@ function runScript(command, args = [], { label, quiet } = {}) {
     const tag = label || cmd;
 
     const proc = spawn(cmd, cmdArgs, {
-      cwd: WORKSPACE,
-      env: { ...process.env, WORKSPACE_DIR: WORKSPACE },
+      cwd: config.workspace,
+      env: { ...process.env, WORKSPACE_DIR: config.workspace },
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -177,24 +210,28 @@ function runClaude(prompt, { maxTurns, tools, label, quiet } = {}) {
 // Dispatch Plan Parsing (extracted to lib/dispatch.js)
 // ══════════════════════════════════════════════════════════════
 
-const dispatch = createDispatcher(runClaude, WORKSPACE);
-
-// Workflow engine — initialized by Task 12 (container bootstrap).
-// Until then, POST /api/work returns 503.
-let workflowEngine = null;
+const dispatch = createDispatcher(runClaude, config.workspace);
 
 // ══════════════════════════════════════════════════════════════
 // API Endpoints
 // ══════════════════════════════════════════════════════════════
 
+// ── Health ──
+
 app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
-    workspace: WORKSPACE,
+    workspace: config.workspace,
     runs: listRuns().length,
-    engineReady: !!workflowEngine,
+    docker: dockerClient ? dockerClient.available : false,
+    cycles: cycleRegistry ? cycleRegistry.getStatus() : null,
+    ports: portAllocator ? portAllocator.getStatus() : null,
+    tokens: tokenPool ? tokenPool.getStatus() : null,
+    diskPressure: healthMonitor ? healthMonitor.isDiskPressured() : false,
   });
 });
+
+// ── Work Submission ──
 
 app.post("/api/work", upload.array("images", 10), async (req, res) => {
   if (!workflowEngine) {
@@ -212,6 +249,8 @@ app.post("/api/work", upload.array("images", 10), async (req, res) => {
     team: null,
     teamReason: null,
     attachments: [],
+    ports: null,
+    branch: null,
     results: {},
     phases: {},
     feedbackLoops: 0,
@@ -250,7 +289,7 @@ app.post("/api/work", upload.array("images", 10), async (req, res) => {
   }
 
   if (images.length > 0) {
-    const attachDir = join(WORKSPACE, ".orchestrator-runs", run.id, "attachments");
+    const attachDir = join(config.workspace, ".orchestrator-runs", run.id, "attachments");
     mkdirSync(attachDir, { recursive: true });
     for (const img of images) {
       // Sanitize filename
@@ -270,6 +309,8 @@ app.post("/api/work", upload.array("images", 10), async (req, res) => {
     message: "Claude is analyzing the task to select the right team...",
     statusUrl: `/api/runs/${run.id}`,
     attachments: run.attachments.length,
+    ports: run.ports,
+    branch: run.branch,
   });
 
   // Async: select team → execute full pipeline
@@ -300,6 +341,8 @@ app.post("/api/work", upload.array("images", 10), async (req, res) => {
     }
   })();
 });
+
+// ── Runs ──
 
 app.get("/api/runs", (req, res) => {
   const runs = listRuns().map(({ id, status, task, team, results, feedbackLoops, createdAt, updatedAt }) => ({
@@ -353,32 +396,164 @@ app.post("/api/runs/:id/revalidate", (req, res) => {
   res.json({ message: "Re-validation started", statusUrl: `/api/runs/${run.id}` });
 });
 
+// ── Cycles ──
+
+app.get("/api/cycles", (req, res) => {
+  const cycles = cycleRegistry.getAll().map((c) => ({
+    id: c.id,
+    status: c.status,
+    team: c.team,
+    branch: c.branch,
+    ports: c.ports,
+    appRunning: c.appRunning,
+    currentPhase: c.currentPhase,
+    startedAt: c.startedAt,
+  }));
+  res.json({ data: cycles });
+});
+
+app.get("/api/cycles/:id", (req, res) => {
+  const cycle = cycleRegistry.get(req.params.id);
+  if (!cycle) return res.status(404).json({ error: "Cycle not found" });
+  res.json(cycle);
+});
+
+app.post("/api/cycles/:id/stop", async (req, res) => {
+  const cycle = cycleRegistry.get(req.params.id);
+  if (!cycle) return res.status(404).json({ error: "Cycle not found" });
+  try {
+    await containerManager.teardown(req.params.id, { keepVolume: true, keepBranch: true });
+    cycleRegistry.update(req.params.id, { status: "failed", appRunning: false });
+    res.json({ stopped: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/cycles/:id/cleanup", async (req, res) => {
+  const cycle = cycleRegistry.get(req.params.id);
+  if (!cycle) return res.status(404).json({ error: "Cycle not found" });
+  try {
+    await containerManager.teardown(req.params.id, { keepVolume: false, keepBranch: false });
+    cycleRegistry.remove(req.params.id);
+    res.json({ cleaned: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/cycles/:id/logs", async (req, res) => {
+  const cycle = cycleRegistry.get(req.params.id);
+  if (!cycle || !cycle.containerId) return res.status(404).json({ error: "Cycle not found" });
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+
+  try {
+    const logStream = await dockerClient.getContainerLogs(cycle.containerId, true);
+    logStream.on("data", (chunk) => {
+      res.write(`data: ${chunk.toString().replace(/\n/g, "\ndata: ")}\n\n`);
+    });
+    logStream.on("end", () => res.end());
+    req.on("close", () => { try { logStream.destroy(); } catch {} });
+  } catch (err) {
+    res.write(`data: Error: ${err.message}\n\n`);
+    res.end();
+  }
+});
+
+// ── Worker Image ──
+
+app.post("/api/worker-image/rebuild", async (req, res) => {
+  try {
+    await containerManager.ensureWorkerImage(true);
+    res.json({ rebuilt: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════
 // Dashboard
 // ══════════════════════════════════════════════════════════════
 
 app.get("/", (req, res) => {
   const runs = listRuns();
+  const cycles = cycleRegistry.getAll();
 
   const statusColors = {
     complete: "#22c55e", failed: "#ef4444",
     validating: "#8b5cf6", qa_running: "#6366f1",
     implementing: "#f59e0b", dispatching: "#38bdf8",
     planning: "#fb923c", team_selecting: "#7b7f9e", queued: "#7b7f9e",
+    pending: "#7b7f9e", interrupted: "#ef4444",
   };
 
   const statusLabels = {
     team_selecting: "ROUTING", planning: "PLANNING", dispatching: "PARSING",
     implementing: "CODING", qa_running: "QA", validating: "VALIDATING",
     complete: "COMPLETE", failed: "FAILED",
+    pending: "PENDING", interrupted: "INTERRUPTED",
   };
 
+  // ── Active Cycles Panel ──
+  const cycleRows = cycles
+    .filter((c) => !["complete", "failed"].includes(c.status))
+    .map((c) => {
+      const color = statusColors[c.status] || "#7b7f9e";
+      const label = statusLabels[c.status] || c.status.toUpperCase();
+      const teamBadge = c.team === "TheATeam"
+        ? '<span style="color:#6366f1">TheATeam</span>'
+        : c.team === "TheFixer"
+          ? '<span style="color:#f59e0b">TheFixer</span>'
+          : '<span style="color:#7b7f9e">--</span>';
+
+      // Find the corresponding run for the task text
+      const run = runs.find((r) => r.id === c.id);
+      const taskText = run ? (run.task || "").slice(0, 60) : "";
+
+      // App link — constructed client-side via inline JS
+      const appLink = c.ports && c.appRunning
+        ? `<a class="app-link" data-port="${c.ports.frontend}" href="#" onclick="window.open('http://'+location.hostname+':${c.ports.frontend}','_blank');return false;">[App]</a>`
+        : "";
+
+      const stopBtn = `<button class="stop-btn" onclick="fetch('/api/cycles/${c.id}/stop',{method:'POST'}).then(()=>location.reload())">[Stop]</button>`;
+
+      return `<tr>
+        <td><a href="/api/cycles/${c.id}">${c.id.slice(-12)}</a></td>
+        <td>${teamBadge}</td>
+        <td style="color:${color};font-weight:600">${label}</td>
+        <td>${c.currentPhase || "--"}</td>
+        <td>${taskText}</td>
+        <td>${appLink}</td>
+        <td>${stopBtn}</td>
+      </tr>`;
+    }).join("\n");
+
+  const portsExhausted = portAllocator.isExhausted();
+  const queueIndicator = portsExhausted
+    ? '<div class="queue-banner"><span>Port slots exhausted — new cycles will queue until a slot frees up.</span></div>'
+    : "";
+
+  const activeCyclesPanel = cycles.filter((c) => !["complete", "failed"].includes(c.status)).length > 0
+    ? `<div class="panel">
+        <h2>Active Cycles</h2>
+        ${queueIndicator}
+        <table>
+          <thead><tr><th>Cycle</th><th>Team</th><th>Status</th><th>Phase</th><th>Task</th><th>App</th><th>Action</th></tr></thead>
+          <tbody>${cycleRows}</tbody>
+        </table>
+      </div>`
+    : (portsExhausted ? `<div class="panel"><h2>Active Cycles</h2>${queueIndicator}<p class="empty">No active cycles.</p></div>` : "");
+
+  // ── Runs Table ──
   const rows = runs.map((r) => {
     const teamBadge = r.team === "TheATeam"
       ? '<span style="color:#6366f1">TheATeam</span>'
       : r.team === "TheFixer"
         ? '<span style="color:#f59e0b">TheFixer</span>'
-        : '<span style="color:#7b7f9e">—</span>';
+        : '<span style="color:#7b7f9e">--</span>';
 
     const color = statusColors[r.status] || "#7b7f9e";
     const label = statusLabels[r.status] || r.status.toUpperCase();
@@ -398,11 +573,11 @@ app.get("/", (req, res) => {
       ? '<span style="color:#22c55e;font-weight:700">PASS</span>'
       : r.results?.allPassed === false
         ? '<span style="color:#ef4444;font-weight:700">FAIL</span>'
-        : "—";
+        : "--";
 
     const elapsed = r.updatedAt && r.createdAt
       ? `${Math.round((new Date(r.updatedAt) - new Date(r.createdAt)) / 1000)}s`
-      : "—";
+      : "--";
 
     return `<tr>
       <td><a href="/api/runs/${r.id}">${r.id.slice(-12)}</a></td>
@@ -425,8 +600,8 @@ app.get("/", (req, res) => {
     .filter((r) => r.app && r.app.running)
     .map((r) => `<div class="app-banner running">
       <span>App (${r.id.slice(-12)}):</span>
-      ${r.app.backend ? `<a href="${r.app.backend}" target="_blank">Backend ${r.app.backend}</a>` : ""}
-      ${r.app.frontend ? `<a href="${r.app.frontend}" target="_blank">Frontend ${r.app.frontend}</a>` : ""}
+      ${r.app.backend ? `<a href="#" onclick="window.open('http://'+location.hostname+':${r.ports ? r.ports.backend : 3001}','_blank');return false;">Backend :${r.ports ? r.ports.backend : "?"}</a>` : ""}
+      ${r.app.frontend ? `<a href="#" onclick="window.open('http://'+location.hostname+':${r.ports ? r.ports.frontend : 5173}','_blank');return false;">Frontend :${r.ports ? r.ports.frontend : "?"}</a>` : ""}
     </div>`)
     .join("\n");
 
@@ -436,6 +611,7 @@ app.get("/", (req, res) => {
 <style>
   body { font-family: -apple-system, system-ui, sans-serif; background: #0f1117; color: #e2e4f0; padding: 2rem; }
   h1 { font-size: 1.4rem; color: #6366f1; margin-bottom: 0.25rem; }
+  h2 { font-size: 1.1rem; color: #8b5cf6; margin: 0 0 0.75rem 0; }
   .subtitle { color: #7b7f9e; font-size: 0.85rem; margin-bottom: 1.5rem; }
   table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
   th { text-align: left; padding: 0.5rem; color: #7b7f9e; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid #2a2d3e; }
@@ -443,20 +619,26 @@ app.get("/", (req, res) => {
   a { color: #6366f1; text-decoration: none; }
   a:hover { text-decoration: underline; }
   .empty { color: #7b7f9e; padding: 2rem; text-align: center; }
+  .panel { background: #161822; border: 1px solid #2a2d3e; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
   .engine-banner { padding: 0.5rem 1rem; border-radius: 8px; margin-bottom: 0.5rem; font-size: 0.8rem; }
   .engine-banner.ready { background: #052e16; border: 1px solid #22c55e; color: #22c55e; }
   .engine-banner.offline { background: #1a1d27; border: 1px solid #7b7f9e; color: #7b7f9e; }
   .app-banner { padding: 0.75rem 1rem; border-radius: 8px; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 1rem; font-size: 0.9rem; }
   .app-banner.running { background: #052e16; border: 1px solid #22c55e; }
   .app-banner a { color: #22c55e; font-weight: 600; }
+  .queue-banner { background: #451a03; border: 1px solid #f59e0b; color: #f59e0b; padding: 0.5rem 1rem; border-radius: 6px; margin-bottom: 0.5rem; font-size: 0.8rem; }
   .legend { display: flex; gap: 1rem; flex-wrap: wrap; margin: 1rem 0; font-size: 0.75rem; }
   .legend span { display: flex; align-items: center; gap: 0.25rem; }
   .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .stop-btn { background: #7f1d1d; color: #fca5a5; border: 1px solid #ef4444; border-radius: 4px; padding: 0.2rem 0.5rem; cursor: pointer; font-size: 0.75rem; }
+  .stop-btn:hover { background: #991b1b; }
+  .app-link { color: #22c55e; font-weight: 600; }
 </style></head><body>
 <h1>claude-ai-OS Pipeline</h1>
 <p class="subtitle">Container-based dispatch: Leader -> Parse -> Code -> QA (feedback loops) -> Validate. Auto-refreshes 10s.</p>
 ${engineBanner}
 ${appBanners}
+${activeCyclesPanel}
 <div class="legend">
   <span><span class="dot" style="background:#7b7f9e"></span> Routing</span>
   <span><span class="dot" style="background:#fb923c"></span> Planning</span>
@@ -479,13 +661,61 @@ ${runs.length === 0 ? '<p class="empty">No runs yet. POST to <code>/api/work</co
 // Start
 // ══════════════════════════════════════════════════════════════
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`claude-ai-OS orchestrator listening on :${PORT}`);
-  console.log(`  Dashboard:  http://localhost:${PORT}`);
-  console.log(`  Submit:     POST http://localhost:${PORT}/api/work`);
-  console.log(`  Workspace:  ${WORKSPACE}`);
-  console.log(`  Engine:     ${workflowEngine ? "container mode" : "not initialized (Task 12 wires it up)"}`);
+app.listen(config.port, "0.0.0.0", async () => {
+  console.log(`claude-ai-OS orchestrator on :${config.port}`);
+  console.log(`  Dashboard: http://localhost:${config.port}`);
+  console.log(`  Submit:    POST http://localhost:${config.port}/api/work`);
+
+  // Initialize Docker
+  await dockerClient.init();
+
+  if (dockerClient.available) {
+    // Check worker image
+    await containerManager.ensureWorkerImage();
+
+    // Recover state from previous runs
+    const activeRuns = listRuns().filter(
+      (r) => !["complete", "failed"].includes(r.status)
+    );
+    if (activeRuns.length > 0) {
+      portAllocator.recover(activeRuns);
+      await cycleRegistry.recover(activeRuns, dockerClient);
+      console.log(`[boot] Recovered ${activeRuns.length} cycles`);
+    }
+
+    // Start health monitoring
+    healthMonitor.start();
+
+    // Create workflow engine with dispatch
+    const engine = new WorkflowEngine({
+      containerManager, cycleRegistry, learningsSync, dispatch, config,
+    });
+    setWorkflowEngine(engine);
+
+    const portStatus = portAllocator.getStatus();
+    console.log(`[boot] Docker mode: ${portStatus.available} ports available`);
+  } else {
+    console.warn("[boot] Docker not available — submit /api/work will return 503");
+  }
 });
 
-// Export for Task 12 integration — allows setting the engine after Docker init
-module.exports = { app, setWorkflowEngine: (engine) => { workflowEngine = engine; } };
+// ══════════════════════════════════════════════════════════════
+// Graceful Shutdown
+// ══════════════════════════════════════════════════════════════
+
+process.on("SIGTERM", () => {
+  console.log("[shutdown] SIGTERM received — stopping health monitor...");
+  healthMonitor.stop();
+  learningsSync.cleanup();
+  process.exit(0);
+});
+
+process.on("SIGINT", () => {
+  console.log("[shutdown] SIGINT received — stopping health monitor...");
+  healthMonitor.stop();
+  learningsSync.cleanup();
+  process.exit(0);
+});
+
+// Export for testing
+module.exports = { app, setWorkflowEngine };
