@@ -1,0 +1,139 @@
+# TheInspector Configuration (OPTIONAL)
+# ──────────────────────────────────────────────────────────────
+# This file is OPTIONAL. Specialists auto-discover project context
+# from CLAUDE.md and the codebase. Use this file to override or
+# add precision that auto-discovery can't provide (e.g., specific
+# threat scenarios, exact latency budgets, custom chaos tests).
+#
+# If this file doesn't exist, specialists will:
+# - Read CLAUDE.md for service URLs, ports, tech stack
+# - Scan source dirs for route files, test files, package manifests
+# - Use sensible defaults for latency budgets and grading
+# ──────────────────────────────────────────────────────────────
+
+project:
+  name: "My Project"            # Used in report headers
+  domain: "web-application"     # Informs threat model focus: web-application, api-service, iot, fintech, access-control, etc.
+
+# ── Services ──────────────────────────────────────────────────
+# Define your running services for dynamic-mode testing.
+# Each service needs a health endpoint for availability detection.
+services:
+  - name: backend
+    health: http://localhost:3001/health
+    metrics: http://localhost:3001/metrics    # optional — for metrics proxy analysis
+    port: 3001
+  # - name: frontend
+  #   health: http://localhost:3000
+  #   port: 3000
+  # - name: worker
+  #   health: http://localhost:4000/health
+  #   port: 4000
+
+# ── Specifications ────────────────────────────────────────────
+# Where your domain truth lives. Quality oracle uses these for drift analysis.
+specs:
+  dir: "Specifications/"                     # Root directory for domain specs
+  implementation_dir: "Specifications/Implementation/"  # Implementation-level specs
+  patterns:
+    traceability: "FR-\\d+"                  # Regex for requirement IDs in code comments (e.g., // Verifies: FR-001)
+    enforcer: "python3 tools/traceability-enforcer.py"  # Command to run traceability check (optional)
+
+# ── Source Code ───────────────────────────────────────────────
+# Where your source code lives. Used for scoping and analysis.
+source:
+  dirs:
+    - "Source/"                               # Main source directory
+  test_dirs:
+    - "Source/Backend/tests/"
+    - "Source/Frontend/tests/"
+  exclude:
+    - "node_modules/"
+    - ".git/"
+    - "dist/"
+    - "build/"
+
+# ── Security ──────────────────────────────────────────────────
+# Domain-specific security context for the red teamer.
+security:
+  # Critical operations that constitute P1 if compromised
+  critical_operations:
+    - "user authentication"
+    - "authorization / access control"
+    - "payment processing"
+    - "PII data access"
+    - "admin operations"
+
+  # Domain-specific threat scenarios (red teamer will attempt these)
+  threat_scenarios:
+    - name: "Authentication bypass"
+      description: "Attacker accesses protected resources without valid credentials"
+      entry_points: ["/api/auth/login", "/api/auth/register"]
+    - name: "Privilege escalation"
+      description: "Normal user gains admin capabilities"
+      entry_points: ["/api/admin/*", "/api/users/*/roles"]
+    - name: "Data exfiltration"
+      description: "Attacker accesses other users' data"
+      entry_points: ["/api/users/*", "/api/accounts/*"]
+
+  # OWASP categories to always check (generic, not domain-specific)
+  owasp_always:
+    - "A01: Broken Access Control"
+    - "A02: Cryptographic Failures"
+    - "A03: Injection"
+    - "A07: Authentication Failures"
+
+# ── Performance ───────────────────────────────────────────────
+# Latency budgets and performance expectations.
+performance:
+  latency_budgets:
+    p95_default_ms: 500           # Default p95 budget for all endpoints
+    p99_default_ms: 2000          # Default p99 budget
+    critical_paths:               # Override budgets for specific paths
+      - path: "/api/auth/login"
+        p95_ms: 300
+      # - path: "/api/checkout"
+      #   p95_ms: 200
+
+  # Patterns to detect in static analysis
+  static_checks:
+    - "N+1 query detection"
+    - "Missing database indexes on foreign keys"
+    - "Unbounded list queries (no LIMIT)"
+    - "Synchronous I/O in request handlers"
+    - "Large payload serialization"
+
+# ── Chaos Testing ─────────────────────────────────────────────
+# Fault injection scenarios for the chaos monkey.
+chaos:
+  mcp_tools: auto-discover        # "auto-discover" or explicit list of MCP tool names
+  fault_scenarios:
+    - name: "Backend restart"
+      description: "Kill and restart the backend — verify recovery"
+      type: "process-kill"
+      target: "backend"
+      expect: "auto-restart within 30s, no data loss"
+    - name: "Database connection drop"
+      description: "Simulate DB connection failure"
+      type: "static-analysis"     # Can't inject this dynamically without DB access
+      expect: "graceful error responses, no crashes"
+    # - name: "Controller offline"
+    #   description: "Stop controller mid-operation"
+    #   type: "process-kill"
+    #   target: "controller"
+    #   expect: "backend handles timeout, events queued"
+
+# ── Grading ───────────────────────────────────────────────────
+# How to assign the overall health grade.
+grading:
+  A: { max_p1: 0, max_p2: 3, min_spec_coverage: 80 }
+  B: { max_p1: 0, max_p2: 8, min_spec_coverage: 60 }
+  C: { max_p1: 2, max_p2: 15, min_spec_coverage: 40 }
+  D: { max_p1: 999 }             # Anything worse = D
+  # F is reserved for: exploitable auth bypass + critical domain failure
+
+# ── Report ────────────────────────────────────────────────────
+report:
+  output_dir: "docs/reports/"
+  filename_pattern: "inspector-audit-{date}.html"
+  backlog_pattern: "bug-backlog-{date}.json"
