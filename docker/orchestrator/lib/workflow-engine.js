@@ -1132,11 +1132,34 @@ ${feedback}`;
         }
       }
 
-      // ── Phase 8: Sync learnings to main ──
+      // ── Phase 8: Sync learnings inside worker (has the correct repo) ──
       console.log(`[${run.id}] Syncing learnings...`);
-      const syncResult = await this.learningsSync.syncLearnings(run.id, `cycle/${run.id}`);
-      if (!syncResult.success) {
-        console.warn(`[${run.id}] Learnings sync failed: ${syncResult.error}`);
+      try {
+        const mainBranch = run.repoBranch || "master";
+        const syncScript = [
+          "cd /workspace",
+          "git stash --include-untracked || true",
+          `git checkout ${mainBranch}`,
+          `git pull origin ${mainBranch}`,
+          `git checkout cycle/${run.id} -- Teams/*/learnings/*.md Teams/TheATeam/*.md Teams/TheFixer/*.md Teams/TheInspector/*.md Teams/Shared/*.md 2>/dev/null || true`,
+          `git checkout cycle/${run.id} -- CLAUDE.md 2>/dev/null || true`,
+          "git add -A",
+          `git diff --cached --quiet || git commit -m "chore: sync learnings from cycle/${run.id}"`,
+          `git push origin ${mainBranch} || true`,
+          `git checkout cycle/${run.id}`,
+          "git stash pop || true",
+        ].join(" && ");
+        const syncResult = await this.containerManager.execInWorker(
+          containerId, "bash", ["-c", syncScript],
+          { label: "learnings-sync", quiet: true }
+        );
+        if (syncResult.exitCode === 0) {
+          console.log(`[${run.id}] Learnings synced to ${mainBranch}`);
+        } else {
+          console.warn(`[${run.id}] Learnings sync had issues (exit ${syncResult.exitCode})`);
+        }
+      } catch (err) {
+        console.warn(`[${run.id}] Learnings sync failed: ${err.message}`);
       }
 
       // ── Finalize ──

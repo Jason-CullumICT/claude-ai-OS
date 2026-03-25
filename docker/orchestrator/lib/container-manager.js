@@ -201,40 +201,85 @@ class ContainerManager {
 
     const result = { backend: false, frontend: false };
 
+    // Write a supervisor script into the container that keeps apps alive.
+    // This runs as a child of PID 1 (tail -f /dev/null) so it persists
+    // after the docker exec session that starts it ends.
+    const supervisorScript = `#!/bin/bash
+# App supervisor — keeps backend and frontend alive
+BACKEND_ENTRY=""
+FRONTEND_ENTRY=""
+
+if [ -f /workspace/Source/Backend/package.json ]; then
+  cd /workspace/Source/Backend
+  if [ -f src/index.ts ]; then BACKEND_ENTRY="npx ts-node src/index.ts"
+  elif [ -f src/server.ts ]; then BACKEND_ENTRY="npx ts-node src/server.ts"
+  elif [ -f src/app.ts ]; then BACKEND_ENTRY="npx ts-node src/app.ts"
+  elif [ -f dist/index.js ]; then BACKEND_ENTRY="node dist/index.js"
+  elif [ -f dist/server.js ]; then BACKEND_ENTRY="node dist/server.js"
+  elif grep -q '"start"' package.json 2>/dev/null; then BACKEND_ENTRY="npm start"
+  fi
+fi
+
+if [ -f /workspace/Source/Frontend/package.json ]; then
+  FRONTEND_ENTRY="npx vite --host 0.0.0.0 --port 5173"
+fi
+
+# Start backend
+if [ -n "$BACKEND_ENTRY" ]; then
+  echo "[supervisor] Starting backend: $BACKEND_ENTRY"
+  cd /workspace/Source/Backend
+  $BACKEND_ENTRY > /tmp/backend.log 2>&1 &
+  BACKEND_PID=$!
+  echo "[supervisor] Backend PID: $BACKEND_PID"
+fi
+
+# Start frontend
+if [ -n "$FRONTEND_ENTRY" ]; then
+  echo "[supervisor] Starting frontend: $FRONTEND_ENTRY"
+  cd /workspace/Source/Frontend
+  $FRONTEND_ENTRY > /tmp/frontend.log 2>&1 &
+  FRONTEND_PID=$!
+  echo "[supervisor] Frontend PID: $FRONTEND_PID"
+fi
+
+# Keep this script alive so its children survive
+echo "[supervisor] Apps started. Waiting..."
+wait
+`;
+
+    // Write supervisor to container and execute it
+    await this.docker.execInContainer(
+      containerId, "bash", ["-c",
+        `cat > /tmp/app-supervisor.sh << 'SUPERVISOR_EOF'\n${supervisorScript}\nSUPERVISOR_EOF\nchmod +x /tmp/app-supervisor.sh`
+      ],
+      { label: "app:setup", quiet: true }
+    );
+
+    // Start supervisor — it runs as a background process inside the container
+    // The key: we DON'T wait for it to complete (it runs forever via `wait`)
+    this.docker.execInContainer(
+      containerId, "bash", ["-c", "nohup /tmp/app-supervisor.sh > /tmp/supervisor.log 2>&1 &"],
+      { label: "app:supervisor", quiet: true }
+    ).catch(() => {}); // Fire and forget — the exec returns when bash exits but supervisor keeps running
+
+    // Give apps time to start
+    await new Promise(r => setTimeout(r, 5000));
+
+    // Verify they're running
     if (checkBackend.exitCode === 0) {
-      // Detect entry point: try common patterns
-      // nohup ensures process survives after exec session ends
-      await this.docker.execInContainer(
-        containerId, "bash", ["-c",
-          `cd /workspace/Source/Backend && ` +
-          `ENTRY=$(` +
-          `  if [ -f src/index.ts ]; then echo "npx ts-node src/index.ts"; ` +
-          `  elif [ -f src/server.ts ]; then echo "npx ts-node src/server.ts"; ` +
-          `  elif [ -f src/app.ts ]; then echo "npx ts-node src/app.ts"; ` +
-          `  elif [ -f dist/index.js ]; then echo "node dist/index.js"; ` +
-          `  elif [ -f dist/server.js ]; then echo "node dist/server.js"; ` +
-          `  elif grep -q '"start"' package.json 2>/dev/null; then echo "npm start"; ` +
-          `  else echo ""; fi` +
-          `) && ` +
-          `if [ -n "$ENTRY" ]; then ` +
-          `  echo "[app] Starting backend: $ENTRY" && ` +
-          `  nohup $ENTRY > /tmp/backend.log 2>&1 & ` +
-          `  disown; ` +
-          `fi`
-        ],
-        { label: "app:backend", quiet: true }
+      const check = await this.docker.execInContainer(
+        containerId, "bash", ["-c", "curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://localhost:3001/ || echo 000"],
+        { quiet: true }
       );
-      result.backend = true;
+      result.backend = check.stdout.trim() !== "000";
     }
 
     if (checkFrontend.exitCode === 0) {
-      await this.docker.execInContainer(
-        containerId, "bash", ["-c",
-          "cd /workspace/Source/Frontend && nohup npx vite --host 0.0.0.0 --port 5173 > /tmp/frontend.log 2>&1 & disown"
-        ],
-        { label: "app:frontend", quiet: true }
+      const check = await this.docker.execInContainer(
+        containerId, "bash", ["-c", "curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://localhost:5173/ || echo 000"],
+        { quiet: true }
       );
-      result.frontend = true;
+      result.frontend = check.stdout.trim() !== "000";
     }
 
     return result;
