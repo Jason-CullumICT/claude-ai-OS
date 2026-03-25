@@ -256,6 +256,9 @@ app.post("/api/work", upload.array("images", 10), async (req, res) => {
     results: {},
     phases: {},
     feedbackLoops: 0,
+    riskLevel: null,
+    e2e: null,
+    pr: null,
     createdAt: ts(),
     updatedAt: ts(),
   };
@@ -571,6 +574,18 @@ app.get("/", (req, res) => {
       ? `<span style="color:#f59e0b;font-size:0.75rem"> +${r.feedbackLoops}fb</span>`
       : "";
 
+    const riskBadge = r.riskLevel
+      ? `<span style="color:${r.riskLevel === "high" ? "#ef4444" : r.riskLevel === "medium" ? "#f59e0b" : "#22c55e"};font-size:0.75rem;font-weight:600">${r.riskLevel.toUpperCase()}</span>`
+      : "";
+
+    const e2eBadge = r.e2e
+      ? `<span style="color:${r.e2e.status === "passed" ? "#22c55e" : r.e2e.status === "failed" ? "#ef4444" : "#7b7f9e"};font-size:0.75rem">E2E:${r.e2e.passed || 0}/${r.e2e.tests || 0}</span>`
+      : "";
+
+    const prBadge = r.pr
+      ? `<a href="${r.pr.url || "#"}" style="font-size:0.75rem">#${r.pr.number || "?"} ${r.pr.status || ""}</a>`
+      : "";
+
     const resultBadge = r.results?.allPassed === true
       ? '<span style="color:#22c55e;font-weight:700">PASS</span>'
       : r.results?.allPassed === false
@@ -587,6 +602,9 @@ app.get("/", (req, res) => {
       <td style="color:${color};font-weight:600">${label}${progress}</td>
       <td>${(r.task || "").slice(0, 80)}</td>
       <td>${resultBadge}${feedbackBadge}</td>
+      <td>${riskBadge}</td>
+      <td>${e2eBadge}</td>
+      <td>${prBadge}</td>
       <td>${elapsed}</td>
       <td>${new Date(r.createdAt).toLocaleString()}</td>
     </tr>`;
@@ -653,7 +671,7 @@ ${activeCyclesPanel}
 </div>
 ${runs.length === 0 ? '<p class="empty">No runs yet. POST to <code>/api/work</code> to submit tasks.</p>' : `
 <table>
-  <thead><tr><th>Run</th><th>Team</th><th>Status</th><th>Task</th><th>Result</th><th>Time</th><th>Created</th></tr></thead>
+  <thead><tr><th>Run</th><th>Team</th><th>Status</th><th>Task</th><th>Result</th><th>Risk</th><th>E2E</th><th>PR</th><th>Time</th><th>Created</th></tr></thead>
   <tbody>${rows}</tbody>
 </table>`}
 </body></html>`);

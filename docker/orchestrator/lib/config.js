@@ -31,6 +31,12 @@ const config = {
 
   // Feedback
   maxFeedbackLoops: 2,
+
+  // Merge pipeline
+  mergeStrategy: process.env.MERGE_STRATEGY || "tiered",           // "tiered" | "manual" | "auto"
+  defaultRiskLevel: process.env.DEFAULT_RISK_LEVEL || "medium",    // "low" | "medium" | "high"
+  autoMergeLow: process.env.AUTO_MERGE_LOW !== "false",            // true by default
+  autoMergeMedium: process.env.AUTO_MERGE_MEDIUM !== "false",      // true by default
 };
 
 module.exports = config;

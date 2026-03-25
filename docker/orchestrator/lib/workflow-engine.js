@@ -156,9 +156,10 @@ ${feedback}`;
   // Helper: parse dispatch plan from worker filesystem
   // ════════════════════════════════════════════════════════════
 
-  async _parseDispatchFromWorker(containerId, leaderOutput, taskWithImages, team) {
+  async _parseDispatchFromWorker(containerId, leaderOutput, taskWithImages, team, runId) {
     // Read plan context from the worker's filesystem
     const planCtx = await this._findPlanContextFromWorker(containerId);
+    planCtx.runId = runId;
 
     if (planCtx.dispatchPlan) {
       console.log(`[dispatch] Found dispatch plan in worker: ${planCtx.dispatchPlan}`);
@@ -332,6 +333,13 @@ ${feedback}`;
 
       console.log(`[${run.id}] Leader plan complete`);
 
+      // ── Risk classification: extract RISK_LEVEL from leader output ──
+      // Verifies: FR-TMP-001
+      const riskMatch = leaderResult.stdout.match(/RISK_LEVEL:\s*(low|medium|high)/i);
+      run.riskLevel = riskMatch ? riskMatch[1].toLowerCase() : this.config.defaultRiskLevel;
+      console.log(`[${run.id}] Risk level: ${run.riskLevel}${riskMatch ? "" : " (default)"}`);
+      saveRunFn(run);
+
       // ── Phase 2: Parse dispatch plan ──
       run.status = "dispatching";
       saveRunFn(run);
@@ -348,7 +356,7 @@ ${feedback}`;
       try {
         // Parse from worker filesystem — reads plan files via docker exec
         dispatchPlan = await this._parseDispatchFromWorker(
-          containerId, leaderResult.stdout, taskWithImages, run.team
+          containerId, leaderResult.stdout, taskWithImages, run.team, run.id
         );
         // Inject image context into every agent prompt
         if (imageContext) {

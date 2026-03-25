@@ -168,6 +168,11 @@ ${dispatchContent.slice(0, 12000)}
 - Write your report to ${planCtx.planDir || "Plans"}/
 - Do NOT edit Source/ files — report issues only
 - Report findings with severity ratings (CRITICAL, HIGH, MEDIUM, LOW, INFO)`;
+
+      // Verifies: FR-TMP-002
+      // Augment QA prompts with E2E test generation instructions
+      const runId = planCtx.runId || "unknown";
+      p += `\n\nAdditionally, write Playwright E2E test files at Source/E2E/tests/cycle-${runId}/ that verify the feature works in a real browser. Tests must run against http://localhost:5173. Use @playwright/test. Each test navigates to a page, interacts with UI elements, and asserts expected outcomes. Import { test, expect } from '@playwright/test'. Create at least one test file per major feature change.`;
     }
 
     return p;

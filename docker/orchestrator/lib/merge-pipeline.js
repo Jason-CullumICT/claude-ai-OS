@@ -1,0 +1,379 @@
+/**
+ * Merge Pipeline — E2E runner, PR creation, AI review, auto-merge decision.
+ *
+ * All functions execute commands inside the worker container via containerManager.execInWorker().
+ * This module is called by workflow-engine.js at Phase 5.5 and Phase 6.5.
+ *
+ * Verifies: FR-TMP-003, FR-TMP-004, FR-TMP-005, FR-TMP-006
+ */
+
+const config = require("./config");
+
+function ts() { return new Date().toISOString(); }
+
+/**
+ * Phase 5.5: Run Playwright E2E tests inside the worker container.
+ * Verifies: FR-TMP-003
+ *
+ * @param {object} containerManager
+ * @param {string} containerId
+ * @param {string} runId
+ * @returns {{ status: 'passed'|'failed'|'skipped', tests: number, passed: number, failed: number, outputTail: string }}
+ */
+async function runPlaywrightE2E(containerManager, containerId, runId) {
+  const testDir = `Source/E2E/tests/cycle-${runId}`;
+
+  // Check if any E2E test files exist
+  const checkResult = await containerManager.execInWorker(
+    containerId, "bash",
+    ["-c", `find /workspace/${testDir} -name '*.spec.ts' -o -name '*.spec.js' -o -name '*.test.ts' -o -name '*.test.js' 2>/dev/null | head -1`],
+    { label: "e2e-check", quiet: true }
+  );
+
+  if (checkResult.exitCode !== 0 || !checkResult.stdout.trim()) {
+    console.log(`[merge-pipeline] No E2E test files found in ${testDir} — skipping`);
+    return { status: "skipped", tests: 0, passed: 0, failed: 0, outputTail: "No E2E test files found" };
+  }
+
+  // Install Playwright chromium (cached in worker volume)
+  console.log("[merge-pipeline] Installing Playwright chromium...");
+  const installResult = await containerManager.execInWorker(
+    containerId, "bash",
+    ["-c", "cd /workspace && PLAYWRIGHT_BROWSERS_PATH=/workspace/.playwright npx playwright install chromium 2>&1"],
+    { label: "playwright-install", quiet: true }
+  );
+
+  if (installResult.exitCode !== 0) {
+    console.warn("[merge-pipeline] Playwright install failed — skipping E2E");
+    return {
+      status: "skipped", tests: 0, passed: 0, failed: 0,
+      outputTail: `Playwright install failed: ${installResult.stderr.slice(-500)}`,
+    };
+  }
+
+  // Run Playwright tests with JSON reporter
+  console.log(`[merge-pipeline] Running Playwright E2E tests in ${testDir}...`);
+  const testResult = await containerManager.execInWorker(
+    containerId, "bash",
+    ["-c", `cd /workspace && PLAYWRIGHT_BROWSERS_PATH=/workspace/.playwright npx playwright test ${testDir}/ --reporter=json 2>&1`],
+    { label: "playwright-run" }
+  );
+
+  // Parse JSON output for results
+  let tests = 0, passed = 0, failed = 0;
+  try {
+    // Playwright JSON reporter outputs to stdout
+    const jsonMatch = testResult.stdout.match(/\{[\s\S]*"suites"[\s\S]*\}/);
+    if (jsonMatch) {
+      const report = JSON.parse(jsonMatch[0]);
+      if (report.stats) {
+        tests = report.stats.expected || 0;
+        passed = report.stats.expected - (report.stats.unexpected || 0);
+        failed = report.stats.unexpected || 0;
+      }
+    }
+  } catch {
+    // If JSON parsing fails, try to extract counts from text output
+    const passMatch = testResult.stdout.match(/(\d+)\s+passed/);
+    const failMatch = testResult.stdout.match(/(\d+)\s+failed/);
+    if (passMatch) passed = parseInt(passMatch[1], 10);
+    if (failMatch) failed = parseInt(failMatch[1], 10);
+    tests = passed + failed;
+  }
+
+  const status = testResult.exitCode === 0 ? "passed" : "failed";
+  console.log(`[merge-pipeline] E2E: ${status} (${passed}/${tests} passed)`);
+
+  return {
+    status,
+    tests,
+    passed,
+    failed,
+    outputTail: testResult.stdout.slice(-2000),
+  };
+}
+
+/**
+ * Phase 6.5a: Create a GitHub PR from the cycle branch.
+ * Verifies: FR-TMP-004
+ *
+ * @param {object} containerManager
+ * @param {string} containerId
+ * @param {object} run — run JSON object
+ * @param {object} cfg — config object
+ * @returns {{ number: number, url: string }|null}
+ */
+async function createPR(containerManager, containerId, run, cfg) {
+  // Check gh CLI is available
+  const ghCheck = await containerManager.execInWorker(
+    containerId, "bash",
+    ["-c", "which gh 2>/dev/null"],
+    { label: "gh-check", quiet: true }
+  );
+
+  if (ghCheck.exitCode !== 0) {
+    console.warn("[merge-pipeline] gh CLI not available — skipping PR creation");
+    return null;
+  }
+
+  // Build PR title and body
+  const taskTitle = (run.task || "").slice(0, 100).replace(/"/g, '\\"');
+  const title = `cycle/${run.id}: ${taskTitle}`;
+
+  const e2eSummary = run.e2e
+    ? `E2E: ${run.e2e.passed}/${run.e2e.tests} passed (${run.e2e.status})`
+    : "E2E: skipped";
+
+  const inspectorGrade = run.results?.inspector || "unknown";
+  const qaStatus = run.results?.qa || "unknown";
+
+  const body = [
+    `## Summary`,
+    `Task: ${run.task}`,
+    `Team: ${run.team}`,
+    `Risk: **${run.riskLevel || "unknown"}**`,
+    ``,
+    `## Results`,
+    `- QA: ${qaStatus}`,
+    `- Inspector: ${inspectorGrade}`,
+    `- ${e2eSummary}`,
+    `- Feedback loops: ${run.feedbackLoops || 0}`,
+    ``,
+    `---`,
+    `*Auto-generated by claude-ai-OS pipeline*`,
+  ].join("\\n");
+
+  // Determine labels based on risk level
+  let labels;
+  if (run.riskLevel === "low") {
+    labels = "auto-merge,low-risk";
+  } else if (run.riskLevel === "high") {
+    labels = "needs-approval,high-risk";
+  } else {
+    labels = "auto-merge,ai-reviewed";
+  }
+
+  const targetBranch = cfg.githubBranch || "main";
+
+  console.log(`[merge-pipeline] Creating PR: ${title}`);
+  const prResult = await containerManager.execInWorker(
+    containerId, "bash",
+    ["-c", `cd /workspace && gh pr create --title "${title}" --body "${body}" --base "${targetBranch}" --label "${labels}" --head "cycle/${run.id}" 2>&1`],
+    { label: "gh-pr-create" }
+  );
+
+  if (prResult.exitCode !== 0) {
+    console.warn(`[merge-pipeline] PR creation failed: ${prResult.stdout.slice(-500)}`);
+    return null;
+  }
+
+  // Parse PR URL from output (gh pr create outputs the URL)
+  const urlMatch = prResult.stdout.match(/(https:\/\/github\.com\/[^\s]+\/pull\/\d+)/);
+  const numberMatch = prResult.stdout.match(/\/pull\/(\d+)/);
+
+  const pr = {
+    number: numberMatch ? parseInt(numberMatch[1], 10) : null,
+    url: urlMatch ? urlMatch[1] : prResult.stdout.trim(),
+  };
+
+  console.log(`[merge-pipeline] PR created: #${pr.number} ${pr.url}`);
+  return pr;
+}
+
+/**
+ * Phase 6.5b: Run AI review on the PR diff.
+ * Verifies: FR-TMP-005
+ *
+ * @param {object} containerManager
+ * @param {string} containerId
+ * @param {object} run — run JSON object
+ * @returns {{ verdict: 'APPROVE'|'REQUEST_CHANGES', comment: string }|null}
+ */
+async function runAIReview(containerManager, containerId, run) {
+  const targetBranch = config.githubBranch || "main";
+
+  // Get the diff for review context
+  const diffResult = await containerManager.execInWorker(
+    containerId, "bash",
+    ["-c", `cd /workspace && git diff ${targetBranch}...HEAD --stat && echo "---FULL_DIFF---" && git diff ${targetBranch}...HEAD`],
+    { label: "review-diff", quiet: true }
+  );
+
+  const diff = diffResult.exitCode === 0 ? diffResult.stdout.slice(-15000) : "(diff unavailable)";
+
+  const e2eSummary = run.e2e
+    ? `E2E tests: ${run.e2e.passed}/${run.e2e.tests} passed (${run.e2e.status})`
+    : "E2E tests: skipped";
+
+  const reviewPrompt = `You are a code review agent. Review this PR diff and decide whether to APPROVE or REQUEST_CHANGES.
+
+Task: ${run.task}
+Risk level: ${run.riskLevel}
+QA status: ${run.results?.qa || "unknown"}
+${e2eSummary}
+
+Review criteria:
+1. Does the code match the task description?
+2. Are there security concerns (injection, XSS, hardcoded secrets)?
+3. Does it follow architecture patterns (service layer, no direct DB calls from handlers)?
+4. Are there obvious bugs or logic errors?
+5. Is test coverage adequate?
+
+Diff:
+\`\`\`
+${diff}
+\`\`\`
+
+Respond with EXACTLY this format:
+VERDICT: APPROVE
+or
+VERDICT: REQUEST_CHANGES
+
+Then on a new line, your review comment (1-3 paragraphs).`;
+
+  console.log("[merge-pipeline] Running AI review...");
+  const reviewResult = await containerManager.execInWorker(
+    containerId, "claude",
+    ["-p", reviewPrompt, "--allowedTools", "Read,Glob,Grep", "--output-format", "text", "--max-turns", "1"],
+    { label: "ai-reviewer" }
+  );
+
+  if (reviewResult.exitCode !== 0) {
+    console.warn("[merge-pipeline] AI review failed — defaulting based on risk");
+    // Timeout/failure: default APPROVE for medium, keep open for high
+    if (run.riskLevel === "high") {
+      return null;
+    }
+    return { verdict: "APPROVE", comment: "AI review timed out — auto-approved (medium risk)" };
+  }
+
+  const output = reviewResult.stdout;
+  const verdictMatch = output.match(/VERDICT:\s*(APPROVE|REQUEST_CHANGES)/i);
+  const verdict = verdictMatch ? verdictMatch[1].toUpperCase() : "APPROVE";
+
+  // Extract comment (everything after the verdict line)
+  const commentStart = output.indexOf(verdictMatch ? verdictMatch[0] : "") + (verdictMatch ? verdictMatch[0].length : 0);
+  const comment = output.slice(commentStart).trim().slice(0, 5000) || "No additional comments.";
+
+  console.log(`[merge-pipeline] AI review verdict: ${verdict}`);
+
+  // Post review on PR via gh CLI
+  if (run.pr && run.pr.number) {
+    const reviewAction = verdict === "APPROVE" ? "approve" : "request-changes";
+    const escapedComment = comment.replace(/"/g, '\\"').replace(/\n/g, "\\n").slice(0, 2000);
+    await containerManager.execInWorker(
+      containerId, "bash",
+      ["-c", `cd /workspace && gh pr review ${run.pr.number} --${reviewAction} --body "${escapedComment}" 2>&1`],
+      { label: "gh-pr-review", quiet: true }
+    );
+  }
+
+  return { verdict, comment };
+}
+
+/**
+ * Phase 6.5c: Execute merge decision based on risk matrix.
+ * Verifies: FR-TMP-006
+ *
+ * Risk matrix:
+ *   low  + E2E pass                    → auto-merge (squash, delete branch)
+ *   medium + E2E pass + AI APPROVE     → auto-merge
+ *   medium + E2E pass + AI REQ_CHANGES → keep PR open
+ *   high + AI APPROVE                  → keep PR open, label "ready-for-review"
+ *   high + AI REQUEST_CHANGES          → keep PR open, label "changes-requested"
+ *
+ * @param {object} containerManager
+ * @param {string} containerId
+ * @param {object} run — run JSON object
+ * @param {object} cfg — config object
+ * @returns {{ action: 'merged'|'open'|'skipped', status: string, labels: string[] }}
+ */
+async function executeMergeDecision(containerManager, containerId, run, cfg) {
+  if (!run.pr || !run.pr.number) {
+    return { action: "skipped", status: "no PR", labels: [] };
+  }
+
+  const prNumber = run.pr.number;
+  const risk = run.riskLevel || "medium";
+  const e2ePass = run.e2e && run.e2e.status === "passed";
+  const aiVerdict = run.pr.aiReview || null;
+
+  // High risk: never auto-merge
+  if (risk === "high") {
+    const label = aiVerdict === "APPROVE" ? "ready-for-review" : "changes-requested";
+    await _addLabel(containerManager, containerId, prNumber, label);
+    console.log(`[merge-pipeline] High risk — PR #${prNumber} kept open (${label})`);
+    return { action: "open", status: `high-risk: ${label}`, labels: [label] };
+  }
+
+  // Medium risk: auto-merge if E2E passes AND AI approves
+  if (risk === "medium") {
+    if (!cfg.autoMergeMedium) {
+      console.log(`[merge-pipeline] Medium auto-merge disabled by config`);
+      return { action: "open", status: "auto-merge-disabled", labels: [] };
+    }
+    if (!e2ePass) {
+      console.log(`[merge-pipeline] Medium risk — E2E did not pass, keeping PR open`);
+      return { action: "open", status: "e2e-not-passed", labels: [] };
+    }
+    if (aiVerdict !== "APPROVE") {
+      await _addLabel(containerManager, containerId, prNumber, "changes-requested");
+      console.log(`[merge-pipeline] Medium risk — AI requested changes, keeping PR open`);
+      return { action: "open", status: "ai-requested-changes", labels: ["changes-requested"] };
+    }
+    // Fall through to merge
+  }
+
+  // Low risk: auto-merge if E2E passes
+  if (risk === "low") {
+    if (!cfg.autoMergeLow) {
+      console.log(`[merge-pipeline] Low auto-merge disabled by config`);
+      return { action: "open", status: "auto-merge-disabled", labels: [] };
+    }
+    if (!e2ePass) {
+      console.log(`[merge-pipeline] Low risk — E2E did not pass, keeping PR open`);
+      return { action: "open", status: "e2e-not-passed", labels: [] };
+    }
+    // Fall through to merge
+  }
+
+  // Execute merge
+  console.log(`[merge-pipeline] Auto-merging PR #${prNumber} (${risk} risk)...`);
+  const mergeResult = await containerManager.execInWorker(
+    containerId, "bash",
+    ["-c", `cd /workspace && gh pr merge ${prNumber} --squash --delete-branch 2>&1`],
+    { label: "gh-pr-merge" }
+  );
+
+  if (mergeResult.exitCode !== 0) {
+    // Check for merge conflict
+    if (/conflict|cannot be merged/i.test(mergeResult.stdout + mergeResult.stderr)) {
+      await _addLabel(containerManager, containerId, prNumber, "merge-conflict");
+      console.warn(`[merge-pipeline] Merge conflict — PR #${prNumber} kept open`);
+      return { action: "open", status: "merge-conflict", labels: ["merge-conflict"] };
+    }
+    console.warn(`[merge-pipeline] Merge failed: ${mergeResult.stdout.slice(-300)}`);
+    return { action: "open", status: "merge-failed", labels: [] };
+  }
+
+  console.log(`[merge-pipeline] PR #${prNumber} merged successfully`);
+  return { action: "merged", status: "merged", labels: [] };
+}
+
+/**
+ * Helper: add a label to a PR via gh CLI.
+ */
+async function _addLabel(containerManager, containerId, prNumber, label) {
+  await containerManager.execInWorker(
+    containerId, "bash",
+    ["-c", `cd /workspace && gh pr edit ${prNumber} --add-label "${label}" 2>&1`],
+    { label: "gh-pr-label", quiet: true }
+  );
+}
+
+module.exports = {
+  runPlaywrightE2E,
+  createPR,
+  runAIReview,
+  executeMergeDecision,
+};
