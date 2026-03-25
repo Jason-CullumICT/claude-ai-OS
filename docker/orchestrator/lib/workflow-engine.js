@@ -1185,6 +1185,24 @@ ${feedback}`;
         console.warn(`[${run.id}] Learnings sync failed: ${err.message}`);
       }
 
+      // ── Phase 9: Auto-update portal if this cycle targeted the portal repo ──
+      if (run.status === "complete" && run.repo) {
+        const isPortalRepo = run.repo.includes("container-test");
+        if (isPortalRepo) {
+          console.log(`[${run.id}] Updating portal with latest code...`);
+          try {
+            const resp = await fetch(`http://localhost:${this.config.port || 8080}/api/portal/update`, {
+              method: "POST",
+            });
+            if (resp.ok) {
+              console.log(`[${run.id}] Portal updated successfully`);
+            }
+          } catch (err) {
+            console.warn(`[${run.id}] Portal update failed: ${err.message}`);
+          }
+        }
+      }
+
       // ── Finalize ──
       this.registry.update(run.id, {
         status: run.status,

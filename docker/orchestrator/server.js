@@ -555,6 +555,76 @@ app.post("/api/worker-image/rebuild", async (req, res) => {
   }
 });
 
+// ── Portal Update ──
+
+app.post("/api/portal/update", async (req, res) => {
+  // Pull latest code into the portal container and restart backend
+  try {
+    const { execFileSync } = require("child_process");
+
+    // Find the portal container
+    const containers = await dockerClient.listContainers({
+      filters: { name: ["portal"] },
+    });
+    const portal = containers.find((c) => c.Names.some((n) => n.includes("portal")));
+    if (!portal) {
+      return res.status(404).json({ error: "Portal container not found" });
+    }
+
+    const portalId = portal.Id;
+    console.log(`[portal] Updating portal (${portalId.slice(0, 12)})...`);
+
+    // Pull latest
+    const pullResult = await dockerClient.execInContainer(
+      portalId, "bash", ["-c",
+        "cd /app && git checkout -- . && git clean -fd 2>/dev/null && git pull origin master 2>&1"
+      ],
+      { label: "portal-update", quiet: true }
+    );
+    console.log(`[portal] Git pull: ${pullResult.stdout.trim().split("\\n").pop()}`);
+
+    // Install deps if package.json changed
+    await dockerClient.execInContainer(
+      portalId, "bash", ["-c",
+        "cd /app/Source/Backend && npm install --production=false 2>/dev/null; cd /app/Source/Frontend && npm install --production=false 2>/dev/null"
+      ],
+      { label: "portal-deps", quiet: true }
+    );
+
+    // Kill old backend process and restart
+    await dockerClient.execInContainer(
+      portalId, "bash", ["-c",
+        "pkill -f 'ts-node\\|node.*index\\|node.*server' 2>/dev/null || true"
+      ],
+      { label: "portal-restart", quiet: true }
+    );
+
+    // Start backend fresh
+    dockerClient.execInContainer(
+      portalId, "bash", ["-c",
+        `cd /app/Source/Backend && ENTRY=$(
+          if [ -f src/index.ts ]; then echo "npx ts-node src/index.ts";
+          elif [ -f src/server.ts ]; then echo "npx ts-node src/server.ts";
+          elif [ -f dist/index.js ]; then echo "node dist/index.js";
+          else echo "npm start"; fi
+        ) && nohup $ENTRY > /tmp/backend.log 2>&1 & disown`
+      ],
+      { label: "portal-backend", quiet: true }
+    ).catch(() => {}); // Fire and forget
+
+    // Frontend (Vite) hot-reloads automatically — no restart needed
+
+    console.log("[portal] Update complete");
+    res.json({
+      updated: true,
+      pull: pullResult.stdout.trim().split("\n").pop(),
+    });
+  } catch (err) {
+    console.error("[portal] Update failed:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════
 // Dashboard
 // ══════════════════════════════════════════════════════════════
