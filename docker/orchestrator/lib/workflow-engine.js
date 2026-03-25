@@ -113,6 +113,9 @@ ${feedback}`;
 
     console.log(`    [agent] ${role} starting (in worker)...`);
 
+    // Refresh credentials before each agent to handle token expiry during long cycles
+    await this.containerManager.refreshCredentials(containerId);
+
     const result = await this.containerManager.execInWorker(
       containerId,
       "claude",
@@ -611,11 +614,22 @@ ${feedback}`;
       });
 
       // ── Phase 0: Spawn worker container ──
-      console.log(`[${run.id}] Spawning worker container...`);
-      const worker = await this.containerManager.spawnWorker(run.id, {
-        repo: run.repo,
-        repoBranch: run.repoBranch,
-      });
+      const isRetry = !!run.reuseVolume;
+      let worker;
+
+      if (isRetry) {
+        console.log(`[${run.id}] RETRY: Spawning worker from existing volume ${run.reuseVolume}...`);
+        worker = await this.containerManager.spawnWorkerFromVolume(run.id, run.reuseVolume, {
+          repo: run.repo,
+          repoBranch: run.repoBranch,
+        });
+      } else {
+        console.log(`[${run.id}] Spawning worker container...`);
+        worker = await this.containerManager.spawnWorker(run.id, {
+          repo: run.repo,
+          repoBranch: run.repoBranch,
+        });
+      }
       containerId = worker.containerId;
 
       // Store container info on run
@@ -641,9 +655,17 @@ ${feedback}`;
         phaseStartedAt: ts(),
       });
 
-      // ── Phase 0b: Initialize workspace ──
-      console.log(`[${run.id}] Initializing workspace in worker...`);
-      await this.containerManager.initWorkspace(containerId, run.id);
+      // ── Phase 0b: Initialize workspace (skip for retries — volume already has code) ──
+      if (isRetry) {
+        console.log(`[${run.id}] RETRY: Skipping workspace init — using existing volume`);
+        // Refresh git credentials in the existing volume
+        await this.containerManager.execInWorker(containerId, "bash", ["-c",
+          `cd /workspace && git config user.name "claude-ai-OS" && git config user.email "pipeline@claude-ai-os.local" && echo "https://${run.repo ? '' : ''}$GITHUB_TOKEN@github.com" > ~/.git-credentials && git config --global credential.helper store`
+        ], { label: "git-auth", quiet: true });
+      } else {
+        console.log(`[${run.id}] Initializing workspace in worker...`);
+        await this.containerManager.initWorkspace(containerId, run.id);
+      }
 
       // ── Phase 0c: Copy image attachments into worker ──
       if (run.attachments && run.attachments.length > 0) {
@@ -684,6 +706,7 @@ ${feedback}`;
       });
 
       console.log(`[${run.id}] Phase 1: ${run.team} leader planning (in worker)...`);
+      await this.containerManager.refreshCredentials(containerId);
 
       // Verifies: FR-TMP-001 — enrich task with risk classification instructions for the leader
       const enrichedTask = this.dispatch.enrichTaskForLeader(run.task);

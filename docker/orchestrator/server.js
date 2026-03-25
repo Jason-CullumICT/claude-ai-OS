@@ -466,6 +466,84 @@ app.get("/api/cycles/:id/logs", async (req, res) => {
   }
 });
 
+// ── Retry ──
+
+app.post("/api/runs/:id/retry", async (req, res) => {
+  if (!workflowEngine) {
+    return res.status(503).json({ error: "Orchestrator not initialized" });
+  }
+
+  const originalRun = loadRun(req.params.id);
+  if (!originalRun) return res.status(404).json({ error: "Run not found" });
+  if (!["failed"].includes(originalRun.status)) {
+    return res.status(409).json({ error: "Only failed runs can be retried" });
+  }
+
+  const existingVolume = `workspace-${originalRun.id}`;
+
+  // Create a new run based on the original
+  const run = {
+    id: `run-${Date.now()}-${randomUUID().slice(0, 8)}`,
+    status: "team_selecting",
+    task: originalRun.task,
+    planFile: originalRun.planFile,
+    repo: originalRun.repo,
+    repoBranch: originalRun.repoBranch,
+    team: null,
+    teamReason: null,
+    attachments: originalRun.attachments || [],
+    ports: null,
+    branch: null,
+    results: {},
+    phases: {},
+    feedbackLoops: 0,
+    retryOf: originalRun.id,
+    reuseVolume: existingVolume,
+    createdAt: ts(),
+    updatedAt: ts(),
+  };
+  saveRun(run);
+
+  res.status(201).json({
+    id: run.id,
+    status: "team_selecting",
+    message: `Retrying failed run ${originalRun.id} with existing volume...`,
+    statusUrl: `/api/runs/${run.id}`,
+    retryOf: originalRun.id,
+  });
+
+  // Async: route and execute
+  (async () => {
+    try {
+      let team, teamReason;
+      const forceTeam = req.body?.team;
+      if (forceTeam && ["TheATeam", "TheFixer"].includes(forceTeam)) {
+        team = forceTeam;
+        teamReason = `Forced to ${forceTeam} by retry request`;
+      } else if (originalRun.team) {
+        team = originalRun.team;
+        teamReason = `Same team as original run: ${originalRun.teamReason}`;
+      } else {
+        const selection = await selectTeam(run.task, run.planFile);
+        team = selection.team;
+        teamReason = selection.reason;
+      }
+
+      run.team = team;
+      run.teamReason = teamReason;
+      console.log(`[${run.id}] Retry of ${originalRun.id} — Team: ${team}`);
+      saveRun(run);
+
+      await workflowEngine.executeWorkflow(run, saveRun);
+    } catch (err) {
+      console.error(`[${run.id}] Retry fatal:`, err);
+      run.status = "failed";
+      run.results = { error: err.message, allPassed: false };
+      saveRun(run);
+    }
+  })();
+});
+
 // ── Worker Image ──
 
 app.post("/api/worker-image/rebuild", async (req, res) => {

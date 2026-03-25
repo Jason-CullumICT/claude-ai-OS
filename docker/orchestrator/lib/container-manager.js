@@ -153,22 +153,94 @@ class ContainerManager {
     };
   }
 
-  async _injectCredentials(containerId) {
-    // Read credentials from orchestrator's own filesystem (bind-mounted from host)
+  /**
+   * Inject fresh credentials into a worker. Called at spawn AND before each agent exec
+   * to handle token refresh during long-running cycles.
+   */
+  async refreshCredentials(containerId) {
     const credPath = "/root/.claude/.credentials.json";
     try {
       const creds = readFileSync(credPath, "utf-8");
-      // Write into worker via exec
       await this.docker.execInContainer(
         containerId, "bash", ["-c",
           `mkdir -p /root/.claude && cat > /root/.claude/.credentials.json << 'CREDEOF'\n${creds}\nCREDEOF\nchmod 600 /root/.claude/.credentials.json`
         ],
         { label: "auth", quiet: true }
       );
-      console.log("[container] Credentials injected into worker");
     } catch (err) {
-      console.warn(`[container] Failed to inject credentials: ${err.message}`);
+      console.warn(`[container] Credential refresh failed: ${err.message}`);
     }
+  }
+
+  // Keep backward compat
+  async _injectCredentials(containerId) {
+    return this.refreshCredentials(containerId);
+  }
+
+  /**
+   * Spawn a worker reusing an existing volume (for retry of failed runs).
+   * Skips clone + npm install since the volume already has the code.
+   */
+  async spawnWorkerFromVolume(runId, existingVolumeName, { repo, repoBranch } = {}) {
+    await this._cleanOrphanedWorkers();
+
+    const ports = this.ports.allocate(runId);
+    if (!ports) throw new Error("No ports available — all slots allocated");
+
+    const token = this.tokens.getTokenForWorker(runId);
+    const containerName = `claude-worker-${runId}`;
+    const networkName = await this._findNetwork();
+
+    const targetRepo = repo || config.githubRepo;
+    const targetBranch = repoBranch || config.githubBranch;
+
+    console.log(`[container] Spawning ${containerName} from existing volume ${existingVolumeName}`);
+
+    try { await this.docker.removeContainer(containerName); } catch {}
+
+    const container = await this.docker.createContainer({
+      Image: config.workerImage,
+      name: containerName,
+      Cmd: ["tail", "-f", "/dev/null"],
+      Env: [
+        `WORKSPACE_DIR=/workspace`,
+        `GITHUB_REPO=${targetRepo}`,
+        `GITHUB_BRANCH=${targetBranch}`,
+        `GITHUB_TOKEN=${config.githubToken}`,
+        `PROJECT_NAME=${config.projectName}`,
+        `RUN_ID=${runId}`,
+        `GIT_AUTHOR_NAME=claude-ai-OS`,
+        `GIT_AUTHOR_EMAIL=pipeline@claude-ai-os.local`,
+      ],
+      HostConfig: {
+        Binds: [`${existingVolumeName}:/workspace`],
+        PortBindings: {
+          "3001/tcp": [{ HostPort: String(ports.backend) }],
+          "5173/tcp": [{ HostPort: String(ports.frontend) }],
+        },
+      },
+      ExposedPorts: { "3001/tcp": {}, "5173/tcp": {} },
+      NetworkingConfig: { EndpointsConfig: { [networkName]: {} } },
+    });
+
+    try {
+      await this.docker.startContainer(container.id);
+    } catch (err) {
+      console.error(`[container] ${containerName} failed to start: ${err.message}`);
+      await this.docker.removeContainer(container.id);
+      this.ports.release(runId);
+      throw err;
+    }
+
+    console.log(`[container] ${containerName} started from volume (id: ${container.id.slice(0, 12)})`);
+    await this.refreshCredentials(container.id);
+
+    return {
+      containerId: container.id,
+      containerName,
+      ports,
+      tokenId: token.tokenId,
+    };
   }
 
   async initWorkspace(containerId, runId) {
