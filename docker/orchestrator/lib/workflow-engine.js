@@ -153,10 +153,387 @@ ${feedback}`;
   }
 
   // ════════════════════════════════════════════════════════════
+  // Phase 5.5: Run Playwright E2E tests against live app
+  // Verifies: FR-TMP-003
+  // ════════════════════════════════════════════════════════════
+
+  async _runPlaywrightE2E(containerId, run, saveRunFn) {
+    const testDir = `Source/E2E/tests/cycle-${run.id}`;
+    const absTestDir = `/workspace/${testDir}`;
+
+    // Check if E2E test files exist in worker
+    // Verifies: FR-TMP-010 — skip gracefully when QA didn't generate tests
+    const testFiles = await this._listWorkerDir(containerId, absTestDir);
+    if (testFiles.length === 0) {
+      console.log(`[${run.id}] No E2E tests found at ${testDir}, skipping`);
+      run.e2e = { status: "skipped", reason: "no_tests" };
+      saveRunFn(run);
+      return true;
+    }
+
+    // Install Playwright chromium if needed
+    // Verifies: FR-TMP-003
+    console.log(`[${run.id}] Installing Playwright chromium...`);
+    const installResult = await this.containerManager.execInWorker(
+      containerId, "bash",
+      ["-c", "PLAYWRIGHT_BROWSERS_PATH=/workspace/.playwright npx playwright install chromium"],
+      { label: "playwright-install" }
+    );
+
+    if (installResult.exitCode !== 0) {
+      // Verifies: FR-TMP-010 — graceful degradation on install failure
+      console.warn(`[${run.id}] Playwright install failed (exit ${installResult.exitCode}), skipping E2E`);
+      run.e2e = { status: "skipped", reason: "install_failed" };
+      saveRunFn(run);
+      return true;
+    }
+
+    // Initialize package.json and install @playwright/test if needed
+    // Verifies: FR-TMP-003
+    await this.containerManager.execInWorker(
+      containerId, "bash",
+      ["-c", "cd /workspace/Source/E2E && (test -f package.json || npm init -y) && npm install @playwright/test 2>/dev/null || true"],
+      { label: "playwright-deps", quiet: true }
+    );
+
+    // Run the E2E tests
+    // Verifies: FR-TMP-003
+    console.log(`[${run.id}] Running Playwright E2E tests from ${testDir}...`);
+    const e2eResult = await this.containerManager.execInWorker(
+      containerId, "bash",
+      ["-c", `cd /workspace/Source/E2E && PLAYWRIGHT_BROWSERS_PATH=/workspace/.playwright npx playwright test tests/cycle-${run.id}/ --reporter=json 2>&1`],
+      { label: "playwright-e2e" }
+    );
+
+    // Parse JSON output for test counts
+    // Verifies: FR-TMP-009
+    let tests = 0, passed = 0, failed = 0;
+    try {
+      const jsonOutput = e2eResult.stdout;
+      const report = JSON.parse(jsonOutput);
+      if (report.suites) {
+        const countSpecs = (suites) => {
+          for (const suite of suites) {
+            if (suite.specs) {
+              for (const spec of suite.specs) {
+                tests += spec.tests ? spec.tests.length : 0;
+                if (spec.tests) {
+                  for (const t of spec.tests) {
+                    if (t.status === "expected" || t.status === "passed") passed++;
+                    else failed++;
+                  }
+                }
+              }
+            }
+            if (suite.suites) countSpecs(suite.suites);
+          }
+        };
+        countSpecs(report.suites);
+      }
+    } catch {
+      // JSON parse failed — fall back to exit code
+      console.warn(`[${run.id}] Could not parse Playwright JSON output, using exit code`);
+      if (e2eResult.exitCode === 0) {
+        tests = 1; passed = 1; failed = 0;
+      } else {
+        tests = 1; passed = 0; failed = 1;
+      }
+    }
+
+    const e2ePassed = e2eResult.exitCode === 0;
+    run.e2e = {
+      status: e2ePassed ? "passed" : "failed",
+      tests,
+      passed,
+      failed,
+      outputTail: e2eResult.stdout.slice(-2000),
+    };
+    saveRunFn(run);
+
+    console.log(`[${run.id}] E2E: ${run.e2e.status} (${passed}/${tests} passed)`);
+    return e2ePassed;
+  }
+
+  // ════════════════════════════════════════════════════════════
+  // Phase 6.5a: Create GitHub PR
+  // Verifies: FR-TMP-004
+  // ════════════════════════════════════════════════════════════
+
+  async _createPR(containerId, run, saveRunFn) {
+    // Check if gh CLI is available
+    // Verifies: FR-TMP-010 — graceful degradation when gh unavailable
+    const ghCheck = await this.containerManager.execInWorker(
+      containerId, "which", ["gh"], { quiet: true }
+    );
+    if (ghCheck.exitCode !== 0) {
+      console.warn(`[${run.id}] gh CLI not available, skipping PR creation`);
+      run.pr = { status: "skipped", reason: "gh_unavailable" };
+      saveRunFn(run);
+      return;
+    }
+
+    // Build PR title and body
+    // Verifies: FR-TMP-004
+    const taskTitle = run.task.replace(/"/g, '\\"').slice(0, 80);
+    const prTitle = `cycle/${run.id}: ${taskTitle}`;
+
+    const e2eSummary = run.e2e
+      ? `E2E: ${run.e2e.status} (${run.e2e.passed || 0}/${run.e2e.tests || 0})`
+      : "E2E: not run";
+
+    const prBody = [
+      `## Cycle ${run.id}`,
+      "",
+      `**Task:** ${run.task.slice(0, 200)}`,
+      `**Risk Level:** ${run.riskLevel}`,
+      `**Team:** ${run.team}`,
+      "",
+      "### Results",
+      `- Implementation: ${run.results?.implementation || "unknown"}`,
+      `- QA: ${run.results?.qa || "unknown"}`,
+      `- Smoketest: ${run.results?.smoketest || "unknown"}`,
+      `- Inspector: ${run.results?.inspector || "unknown"}`,
+      `- ${e2eSummary}`,
+      `- Feedback loops: ${run.feedbackLoops || 0}`,
+    ].join("\n");
+
+    // Determine labels based on risk level
+    // Verifies: FR-TMP-004
+    const labelMap = {
+      low: "auto-merge,low-risk",
+      medium: "auto-merge,ai-reviewed",
+      high: "needs-approval,high-risk",
+    };
+    const labels = labelMap[run.riskLevel] || labelMap.medium;
+
+    // Create PR via gh CLI
+    console.log(`[${run.id}] Creating PR: ${prTitle}`);
+    const prResult = await this.containerManager.execInWorker(
+      containerId, "bash",
+      ["-c", `cd /workspace && gh pr create --title "${prTitle.replace(/"/g, '\\"')}" --body "${prBody.replace(/"/g, '\\"').replace(/\n/g, "\\n")}" --base master --head "cycle/${run.id}" --label "${labels}" 2>&1`],
+      { label: "pr-create" }
+    );
+
+    if (prResult.exitCode !== 0) {
+      // Verifies: FR-TMP-010 — PR creation failure is non-fatal
+      console.warn(`[${run.id}] PR creation failed (exit ${prResult.exitCode}): ${prResult.stdout.slice(-500)}`);
+      run.pr = { status: "failed", reason: prResult.stdout.slice(-500) };
+      saveRunFn(run);
+      return;
+    }
+
+    // Parse PR number and URL from output
+    // Verifies: FR-TMP-009
+    const urlMatch = prResult.stdout.match(/(https:\/\/github\.com\/[^\s]+\/pull\/(\d+))/);
+    run.pr = {
+      number: urlMatch ? parseInt(urlMatch[2], 10) : null,
+      url: urlMatch ? urlMatch[1] : prResult.stdout.trim(),
+      status: "open",
+    };
+    saveRunFn(run);
+
+    console.log(`[${run.id}] PR created: ${run.pr.url || "unknown URL"}`);
+  }
+
+  // ════════════════════════════════════════════════════════════
+  // Phase 6.5b: AI PR Review
+  // Verifies: FR-TMP-005
+  // ════════════════════════════════════════════════════════════
+
+  async _aiReviewPR(containerId, run, saveRunFn) {
+    // Skip for low risk
+    // Verifies: FR-TMP-005
+    if (run.riskLevel === "low") {
+      console.log(`[${run.id}] Skipping AI review for low-risk cycle`);
+      run.pr.aiReview = "skipped";
+      saveRunFn(run);
+      return;
+    }
+
+    if (!run.pr || !run.pr.number) {
+      console.warn(`[${run.id}] No PR number available, skipping AI review`);
+      run.pr = run.pr || {};
+      run.pr.aiReview = "skipped";
+      run.pr.aiReviewComment = "No PR available for review";
+      saveRunFn(run);
+      return;
+    }
+
+    // Get diff for review
+    console.log(`[${run.id}] Getting diff for AI review...`);
+    const diffResult = await this.containerManager.execInWorker(
+      containerId, "bash",
+      ["-c", `cd /workspace && git diff master...cycle/${run.id} 2>/dev/null | head -c 50000`],
+      { label: "pr-diff", quiet: true }
+    );
+
+    const diff = diffResult.exitCode === 0 ? diffResult.stdout : "(diff unavailable)";
+
+    // Build review prompt
+    // Verifies: FR-TMP-005
+    const e2eSummary = run.e2e
+      ? `E2E: ${run.e2e.status} (${run.e2e.passed || 0}/${run.e2e.tests || 0} passed)`
+      : "E2E: not run";
+
+    const reviewPrompt = [
+      "You are a code reviewer. Review this pull request diff and decide: APPROVE or REQUEST_CHANGES.",
+      "",
+      `Task: ${run.task.slice(0, 500)}`,
+      `Risk level: ${run.riskLevel}`,
+      `QA status: ${run.results?.qa || "unknown"}`,
+      `${e2eSummary}`,
+      "",
+      "Review criteria:",
+      "1. Code matches the task description",
+      "2. No security vulnerabilities (injection, XSS, hardcoded secrets)",
+      "3. Follows architecture patterns (service layer, no direct DB in handlers)",
+      "4. No obvious bugs or logic errors",
+      "5. Adequate test coverage",
+      "",
+      "Diff:",
+      "```",
+      diff,
+      "```",
+      "",
+      "Respond with exactly one line: APPROVE or REQUEST_CHANGES",
+      "Then on the next line, provide a brief explanation.",
+    ].join("\n");
+
+    // Run Claude for review
+    console.log(`[${run.id}] Running AI PR review...`);
+    const reviewResult = await this.containerManager.execInWorker(
+      containerId, "claude",
+      ["-p", reviewPrompt, "--allowedTools", "Bash,Read,Glob,Grep", "--output-format", "text"],
+      { label: "ai-review" }
+    );
+
+    // Parse verdict
+    // Verifies: FR-TMP-005
+    let verdict = "APPROVE";
+    let comment = reviewResult.stdout.slice(0, 2000);
+
+    if (reviewResult.exitCode !== 0) {
+      // Verifies: FR-TMP-010 — timeout/failure defaults
+      console.warn(`[${run.id}] AI review failed (exit ${reviewResult.exitCode})`);
+      if (run.riskLevel === "high") {
+        verdict = "REQUEST_CHANGES";
+        comment = "AI review failed — keeping PR open for manual review (high risk)";
+      } else {
+        verdict = "APPROVE";
+        comment = "AI review timed out — defaulting to APPROVE for medium risk";
+      }
+    } else {
+      const output = reviewResult.stdout;
+      if (/REQUEST_CHANGES/i.test(output)) {
+        verdict = "REQUEST_CHANGES";
+      } else {
+        verdict = "APPROVE";
+      }
+    }
+
+    // Post review via gh CLI
+    // Verifies: FR-TMP-005
+    const ghReviewFlag = verdict === "APPROVE" ? "--approve" : `--request-changes`;
+    const escapedComment = comment.replace(/"/g, '\\"').replace(/\n/g, "\\n").slice(0, 1000);
+
+    await this.containerManager.execInWorker(
+      containerId, "bash",
+      ["-c", `cd /workspace && gh pr review ${run.pr.number} ${ghReviewFlag} --body "${escapedComment}" 2>&1 || true`],
+      { label: "pr-review-post", quiet: true }
+    );
+
+    run.pr.aiReview = verdict;
+    run.pr.aiReviewComment = comment;
+    saveRunFn(run);
+
+    console.log(`[${run.id}] AI review: ${verdict}`);
+  }
+
+  // ════════════════════════════════════════════════════════════
+  // Phase 6.5c: Auto-Merge Logic
+  // Verifies: FR-TMP-006
+  // ════════════════════════════════════════════════════════════
+
+  async _autoMerge(containerId, run, saveRunFn) {
+    if (!run.pr || !run.pr.number || run.pr.status !== "open") {
+      console.log(`[${run.id}] No open PR to merge`);
+      return;
+    }
+
+    const { riskLevel } = run;
+    const aiReview = run.pr.aiReview || "skipped";
+    const e2eStatus = run.e2e?.status || "skipped";
+
+    // Decision matrix — Verifies: FR-TMP-006
+    let shouldMerge = false;
+    let newStatus = "open";
+    let labelToAdd = null;
+
+    if (riskLevel === "low" && (e2eStatus === "passed" || e2eStatus === "skipped")) {
+      // Low risk: auto-merge if E2E passed (or skipped)
+      if (this.config.autoMergeLow) {
+        shouldMerge = true;
+      }
+    } else if (riskLevel === "medium") {
+      if (aiReview === "APPROVE" && (e2eStatus === "passed" || e2eStatus === "skipped")) {
+        if (this.config.autoMergeMedium) {
+          shouldMerge = true;
+        }
+      } else if (aiReview === "REQUEST_CHANGES") {
+        newStatus = "changes-requested";
+      }
+    } else if (riskLevel === "high") {
+      if (aiReview === "APPROVE") {
+        labelToAdd = "ready-for-review";
+      } else if (aiReview === "REQUEST_CHANGES") {
+        labelToAdd = "changes-requested";
+      }
+      // High risk never auto-merges
+    }
+
+    if (shouldMerge) {
+      console.log(`[${run.id}] Auto-merging PR #${run.pr.number} (${riskLevel} risk)...`);
+      const mergeResult = await this.containerManager.execInWorker(
+        containerId, "bash",
+        ["-c", `cd /workspace && gh pr merge ${run.pr.number} --squash --delete-branch 2>&1`],
+        { label: "pr-merge" }
+      );
+
+      if (mergeResult.exitCode === 0) {
+        run.pr.status = "merged";
+        console.log(`[${run.id}] PR #${run.pr.number} merged successfully`);
+      } else {
+        // Verifies: FR-TMP-010 — merge conflict handling
+        console.warn(`[${run.id}] Merge failed: ${mergeResult.stdout.slice(-500)}`);
+        run.pr.status = "merge-conflict";
+        // Label the PR with merge-conflict
+        await this.containerManager.execInWorker(
+          containerId, "bash",
+          ["-c", `cd /workspace && gh pr edit ${run.pr.number} --add-label "merge-conflict" 2>&1 || true`],
+          { label: "pr-label", quiet: true }
+        );
+      }
+    } else {
+      run.pr.status = newStatus;
+      if (labelToAdd) {
+        await this.containerManager.execInWorker(
+          containerId, "bash",
+          ["-c", `cd /workspace && gh pr edit ${run.pr.number} --add-label "${labelToAdd}" 2>&1 || true`],
+          { label: "pr-label", quiet: true }
+        );
+      }
+      console.log(`[${run.id}] PR #${run.pr.number} status: ${run.pr.status} (${riskLevel} risk, review=${aiReview})`);
+    }
+
+    saveRunFn(run);
+  }
+
+  // ════════════════════════════════════════════════════════════
   // Helper: parse dispatch plan from worker filesystem
   // ════════════════════════════════════════════════════════════
 
-  async _parseDispatchFromWorker(containerId, leaderOutput, taskWithImages, team) {
+  // Verifies: FR-TMP-002 — runId passed to buildAgentPrompt for E2E test generation
+  async _parseDispatchFromWorker(containerId, leaderOutput, taskWithImages, team, runId) {
     // Read plan context from the worker's filesystem
     const planCtx = await this._findPlanContextFromWorker(containerId);
 
@@ -181,7 +558,7 @@ ${feedback}`;
             parallel: roles.implementation.length > 1,
             agents: roles.implementation.map((role) => ({
               role,
-              prompt: this.dispatch.buildAgentPrompt(role, taskWithImages, team, planCtx),
+              prompt: this.dispatch.buildAgentPrompt(role, taskWithImages, team, planCtx, runId),
             })),
           });
         }
@@ -191,7 +568,7 @@ ${feedback}`;
             parallel: roles.qa.length > 1,
             agents: roles.qa.map((role) => ({
               role,
-              prompt: this.dispatch.buildAgentPrompt(role, taskWithImages, team, planCtx),
+              prompt: this.dispatch.buildAgentPrompt(role, taskWithImages, team, planCtx, runId),
             })),
           });
         }
@@ -245,6 +622,11 @@ ${feedback}`;
       run.containerId = worker.containerId;
       run.containerName = worker.containerName;
       run.ports = worker.ports;
+
+      // Verifies: FR-TMP-009 — Initialize tiered merge pipeline fields
+      run.riskLevel = run.riskLevel || this.config.defaultRiskLevel;
+      run.e2e = run.e2e || null;
+      run.pr = run.pr || null;
       run.branch = `cycle/${run.id}`;
       saveRunFn(run);
 
@@ -303,8 +685,10 @@ ${feedback}`;
 
       console.log(`[${run.id}] Phase 1: ${run.team} leader planning (in worker)...`);
 
+      // Verifies: FR-TMP-001 — enrich task with risk classification instructions for the leader
+      const enrichedTask = this.dispatch.enrichTaskForLeader(run.task);
       // Append image references to task so the leader sees them
-      const taskWithImages = run.task + imageContext;
+      const taskWithImages = enrichedTask + imageContext;
 
       const leaderResult = await this.containerManager.execInWorker(
         containerId,
@@ -332,6 +716,13 @@ ${feedback}`;
 
       console.log(`[${run.id}] Leader plan complete`);
 
+      // ── Phase 1b: Extract risk level from leader output ──
+      // Verifies: FR-TMP-001
+      const riskMatch = leaderResult.stdout.match(/RISK_LEVEL:\s*(low|medium|high)/i);
+      run.riskLevel = riskMatch ? riskMatch[1].toLowerCase() : this.config.defaultRiskLevel;
+      console.log(`[${run.id}] Risk level: ${run.riskLevel}`);
+      saveRunFn(run);
+
       // ── Phase 2: Parse dispatch plan ──
       run.status = "dispatching";
       saveRunFn(run);
@@ -347,8 +738,9 @@ ${feedback}`;
       let dispatchPlan;
       try {
         // Parse from worker filesystem — reads plan files via docker exec
+        // Verifies: FR-TMP-002 — pass run.id for E2E test path generation
         dispatchPlan = await this._parseDispatchFromWorker(
-          containerId, leaderResult.stdout, taskWithImages, run.team
+          containerId, leaderResult.stdout, taskWithImages, run.team, run.id
         );
         // Inject image context into every agent prompt
         if (imageContext) {
@@ -601,6 +993,94 @@ ${feedback}`;
 
       console.log(`[${run.id}] === WORKFLOW ${run.status.toUpperCase()} === leader=${run.results.leader} impl=${run.results.implementation} qa=${run.results.qa} smoke=${run.results.smoketest} inspect=${run.results.inspector} feedbackLoops=${feedbackLoops}`);
 
+      // ── Phase 5.5: Run Playwright E2E tests against live app ──
+      // Verifies: FR-TMP-003
+      if (run.app && run.app.running) {
+        this.registry.update(run.id, {
+          currentPhase: "e2e",
+          phaseStartedAt: ts(),
+        });
+
+        console.log(`[${run.id}] Phase 5.5: Running Playwright E2E tests...`);
+        run.phases.e2e = { status: "running", startedAt: ts() };
+        saveRunFn(run);
+
+        try {
+          let e2ePassed = await this._runPlaywrightE2E(containerId, run, saveRunFn);
+
+          // Verifies: FR-TMP-003 — E2E feedback loop (shared counter with QA)
+          if (!e2ePassed && feedbackLoops < this.config.maxFeedbackLoops && lastImplStageIdx >= 0) {
+            feedbackLoops++;
+            console.log(`[${run.id}] E2E feedback loop ${feedbackLoops}/${this.config.maxFeedbackLoops}`);
+
+            const e2eFeedback = `E2E TEST FAILURES:\n${run.e2e.outputTail || "(no output)"}`;
+
+            // Re-run implementation with E2E feedback
+            const implStage = dispatchPlan.stages[lastImplStageIdx];
+            const fbKey = `feedback_e2e_${feedbackLoops}_impl`;
+            run.phases[fbKey] = { status: "running", startedAt: ts(), agents: {} };
+            saveRunFn(run);
+
+            const implResult = await this.executeStageInWorker(containerId, implStage, e2eFeedback);
+            for (const ar of implResult.agentResults) {
+              run.phases[fbKey].agents[ar.role] = {
+                status: ar.exitCode === 0 ? "passed" : "failed",
+                exitCode: ar.exitCode,
+                outputTail: ar.outputTail,
+              };
+            }
+            run.phases[fbKey].status = implResult.passed ? "passed" : "failed";
+            run.phases[fbKey].completedAt = ts();
+            saveRunFn(run);
+
+            // Re-run QA
+            const qaStages = dispatchPlan.stages.filter(s => /qa|verification|review|test/i.test(s.name));
+            if (qaStages.length > 0) {
+              const qaStage = qaStages[qaStages.length - 1];
+              const fbQaKey = `feedback_e2e_${feedbackLoops}_qa`;
+              run.phases[fbQaKey] = { status: "running", startedAt: ts(), agents: {} };
+              saveRunFn(run);
+
+              const qaResult = await this.executeStageInWorker(containerId, qaStage);
+              for (const ar of qaResult.agentResults) {
+                run.phases[fbQaKey].agents[ar.role] = {
+                  status: ar.exitCode === 0 ? "passed" : "failed",
+                  exitCode: ar.exitCode,
+                  outputTail: ar.outputTail,
+                };
+              }
+              run.phases[fbQaKey].status = qaResult.passed ? "passed" : "failed";
+              run.phases[fbQaKey].completedAt = ts();
+              saveRunFn(run);
+            }
+
+            // Re-run E2E
+            e2ePassed = await this._runPlaywrightE2E(containerId, run, saveRunFn);
+          }
+
+          run.phases.e2e.status = run.e2e.status === "passed" ? "passed" : (run.e2e.status === "skipped" ? "skipped" : "failed");
+          run.phases.e2e.completedAt = ts();
+
+          // Verifies: FR-TMP-009 — update results with E2E status
+          run.results.e2e = run.e2e.status;
+          run.feedbackLoops = feedbackLoops;
+          saveRunFn(run);
+        } catch (err) {
+          // Verifies: FR-TMP-010 — E2E errors are non-fatal
+          console.warn(`[${run.id}] E2E phase error: ${err.message}`);
+          run.e2e = { status: "skipped", reason: "error", error: err.message };
+          run.phases.e2e.status = "skipped";
+          run.phases.e2e.completedAt = ts();
+          run.results.e2e = "skipped";
+          saveRunFn(run);
+        }
+      } else {
+        console.log(`[${run.id}] App not running, skipping E2E phase`);
+        run.e2e = { status: "skipped", reason: "app_not_running" };
+        run.results.e2e = "skipped";
+        saveRunFn(run);
+      }
+
       // App is already running from Phase 3.5 — no need to start again.
       // It stays running on the worker's allocated ports for user testing.
 
@@ -608,6 +1088,49 @@ ${feedback}`;
       console.log(`[${run.id}] Committing and pushing...`);
       const commitMsg = `feat: ${run.task.slice(0, 100)}`;
       await this.containerManager.commitAndPush(containerId, run.id, commitMsg);
+
+      // ── Phase 6.5: PR creation, AI review, and auto-merge ──
+      // Verifies: FR-TMP-004, FR-TMP-005, FR-TMP-006
+      if (this.config.mergeStrategy !== "manual") {
+        this.registry.update(run.id, {
+          currentPhase: "pr_merge",
+          phaseStartedAt: ts(),
+        });
+
+        console.log(`[${run.id}] Phase 6.5: PR creation and merge decision...`);
+        run.phases.prMerge = { status: "running", startedAt: ts() };
+        saveRunFn(run);
+
+        try {
+          // Phase 6.5a: Create PR — Verifies: FR-TMP-004
+          await this._createPR(containerId, run, saveRunFn);
+
+          // Phase 6.5b: AI Review (medium/high only) — Verifies: FR-TMP-005
+          if (run.pr && run.pr.status === "open") {
+            await this._aiReviewPR(containerId, run, saveRunFn);
+          }
+
+          // Phase 6.5c: Auto-merge decision — Verifies: FR-TMP-006
+          if (run.pr && (run.pr.status === "open" || run.pr.status === "changes-requested")) {
+            await this._autoMerge(containerId, run, saveRunFn);
+          }
+
+          run.phases.prMerge.status = "completed";
+          run.phases.prMerge.completedAt = ts();
+
+          // Verifies: FR-TMP-009 — persist PR state in results
+          run.results.pr = run.pr ? run.pr.status : "skipped";
+          saveRunFn(run);
+        } catch (err) {
+          // Verifies: FR-TMP-010 — PR/merge errors are non-fatal
+          console.warn(`[${run.id}] PR/merge phase error: ${err.message}`);
+          run.phases.prMerge.status = "failed";
+          run.phases.prMerge.completedAt = ts();
+          run.phases.prMerge.error = err.message;
+          run.results.pr = "error";
+          saveRunFn(run);
+        }
+      }
 
       // ── Phase 8: Sync learnings to main ──
       console.log(`[${run.id}] Syncing learnings...`);

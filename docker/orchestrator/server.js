@@ -346,9 +346,10 @@ app.post("/api/work", upload.array("images", 10), async (req, res) => {
 
 // ── Runs ──
 
+// Verifies: FR-TMP-009 — include riskLevel, e2e, and pr in run list responses
 app.get("/api/runs", (req, res) => {
-  const runs = listRuns().map(({ id, status, task, team, results, feedbackLoops, createdAt, updatedAt }) => ({
-    id, status, task, team, results, feedbackLoops, createdAt, updatedAt,
+  const runs = listRuns().map(({ id, status, task, team, results, feedbackLoops, riskLevel, e2e, pr, createdAt, updatedAt }) => ({
+    id, status, task, team, results, feedbackLoops, riskLevel, e2e, pr, createdAt, updatedAt,
   }));
   res.json({ data: runs });
 });

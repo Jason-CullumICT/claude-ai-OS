@@ -127,7 +127,8 @@ ${dispatchContent.slice(0, 12000)}
    * Build a self-contained prompt for an agent.
    * Agents read the dispatch plan file themselves to find their specific assignments.
    */
-  function buildAgentPrompt(role, task, team, planCtx) {
+  // Verifies: FR-TMP-002 (QA E2E Prompt Injection), FR-TMP-001 (Risk Classification leader enrichment)
+  function buildAgentPrompt(role, task, team, planCtx, runId) {
     const isImpl = /coder|fixer/i.test(role);
     // Strip trailing number for role file lookup (backend-coder-1 -> backend-coder.md)
     const roleBase = role.replace(/-\d+$/, "");
@@ -168,6 +169,28 @@ ${dispatchContent.slice(0, 12000)}
 - Write your report to ${planCtx.planDir || "Plans"}/
 - Do NOT edit Source/ files — report issues only
 - Report findings with severity ratings (CRITICAL, HIGH, MEDIUM, LOW, INFO)`;
+
+      // Verifies: FR-TMP-002 — QA agents generate Playwright E2E tests
+      if (runId) {
+        p += `\n\nE2E Test Generation (MANDATORY):
+Write Playwright E2E test files at Source/E2E/tests/cycle-${runId}/ that verify
+the feature works in a real browser. Tests must run against http://localhost:5173.
+Use @playwright/test. Each test file should:
+1. Navigate to each new/modified page
+2. Verify key UI elements are present (headings, forms, buttons)
+3. Fill out forms, submit, verify response
+4. Click through the primary user flow for the feature
+5. Verify no console errors during navigation
+
+Test template:
+import { test, expect } from '@playwright/test';
+test.describe('Feature: {name}', () => {
+  test('should render the main page', async ({ page }) => {
+    await page.goto('http://localhost:5173/{route}');
+    await expect(page.getByRole('heading', { name: '{heading}' })).toBeVisible();
+  });
+});`;
+      }
     }
 
     return p;
@@ -177,7 +200,8 @@ ${dispatchContent.slice(0, 12000)}
    * Parse leader output into structured dispatch stages.
    * Strategy: read dispatch plan file -> extract roles -> build prompts in Node.js
    */
-  async function parseDispatchPlan(leaderOutput, task, team) {
+  // Verifies: FR-TMP-002 — runId threaded through for E2E test generation
+  async function parseDispatchPlan(leaderOutput, task, team, runId) {
     const planCtx = findPlanContext();
 
     if (planCtx.dispatchPlan) {
@@ -194,7 +218,7 @@ ${dispatchContent.slice(0, 12000)}
           parallel: roles.implementation.length > 1,
           agents: roles.implementation.map((role) => ({
             role,
-            prompt: buildAgentPrompt(role, task, team, planCtx),
+            prompt: buildAgentPrompt(role, task, team, planCtx, runId),
           })),
         });
       }
@@ -204,7 +228,7 @@ ${dispatchContent.slice(0, 12000)}
           parallel: roles.qa.length > 1,
           agents: roles.qa.map((role) => ({
             role,
-            prompt: buildAgentPrompt(role, task, team, planCtx),
+            prompt: buildAgentPrompt(role, task, team, planCtx, runId),
           })),
         });
       }
@@ -262,6 +286,17 @@ ${dispatchContent.slice(0, 12000)}
     };
   }
 
+  // Verifies: FR-TMP-001 — Enrich task text with risk classification instructions for the leader
+  function enrichTaskForLeader(task) {
+    return `${task}
+
+Classify this task's risk level for merge strategy:
+- low: bug fix, < 3 files, no schema changes
+- medium: new feature, new pages/endpoints, 3-20 files
+- high: architecture change, schema migration, auth/security, > 20 files
+Include in your output: RISK_LEVEL: low|medium|high`;
+  }
+
   return {
     findPlanContext,
     extractRoles,
@@ -270,6 +305,7 @@ ${dispatchContent.slice(0, 12000)}
     parseDispatchPlan,
     buildFallbackPlan,
     extractJson,
+    enrichTaskForLeader,
   };
 }
 

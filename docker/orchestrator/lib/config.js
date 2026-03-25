@@ -31,6 +31,13 @@ const config = {
 
   // Feedback
   maxFeedbackLoops: 2,
+
+  // Tiered merge pipeline (FR-TMP-007)
+  // Verifies: FR-TMP-007
+  mergeStrategy: process.env.MERGE_STRATEGY || "tiered",
+  defaultRiskLevel: process.env.DEFAULT_RISK_LEVEL || "medium",
+  autoMergeLow: process.env.AUTO_MERGE_LOW !== "false",
+  autoMergeMedium: process.env.AUTO_MERGE_MEDIUM !== "false",
 };
 
 module.exports = config;
