@@ -235,7 +235,10 @@ ${feedback}`;
 
       // ── Phase 0: Spawn worker container ──
       console.log(`[${run.id}] Spawning worker container...`);
-      const worker = await this.containerManager.spawnWorker(run.id);
+      const worker = await this.containerManager.spawnWorker(run.id, {
+        repo: run.repo,
+        repoBranch: run.repoBranch,
+      });
       containerId = worker.containerId;
 
       // Store container info on run

@@ -146,10 +146,11 @@ services:
   portal:
     image: node:22-slim
     ports:
-      - "${PORTAL_BACKEND_PORT:-4001}:3001"
-      - "${PORTAL_FRONTEND_PORT:-4173}:5173"
+      - "${PORTAL_BACKEND_PORT:-4201}:3001"
+      - "${PORTAL_FRONTEND_PORT:-4200}:5173"
     environment:
       - ORCHESTRATOR_URL=http://orchestrator:8080
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
       - NODE_ENV=development
       - PORT=3001
     volumes:
@@ -159,8 +160,12 @@ services:
       - |
         set -e
         apt-get update && apt-get install -y git > /dev/null 2>&1
+        REPO_URL="https://github.com/Jason-CullumICT/container-test"
+        if [ -n "$$GITHUB_TOKEN" ]; then
+          REPO_URL="https://$$GITHUB_TOKEN@github.com/Jason-CullumICT/container-test"
+        fi
         if [ ! -f /app/.git/HEAD ]; then
-          git clone https://github.com/Jason-CullumICT/container-test /app
+          git clone "$$REPO_URL" /app
         else
           cd /app && git pull origin master || true
         fi

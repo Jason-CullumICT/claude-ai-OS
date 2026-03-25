@@ -238,7 +238,7 @@ app.post("/api/work", upload.array("images", 10), async (req, res) => {
     return res.status(503).json({ error: "Orchestrator not initialized — Docker not available" });
   }
 
-  const { task, planFile, team: forceTeam } = req.body;
+  const { task, planFile, team: forceTeam, repo, repoBranch } = req.body;
   if (!task) return res.status(400).json({ error: "Missing required field: task" });
 
   const run = {
@@ -246,6 +246,8 @@ app.post("/api/work", upload.array("images", 10), async (req, res) => {
     status: "team_selecting",
     task,
     planFile: planFile || null,
+    repo: repo || config.githubRepo,           // per-task repo override
+    repoBranch: repoBranch || config.githubBranch, // per-task branch override
     team: null,
     teamReason: null,
     attachments: [],

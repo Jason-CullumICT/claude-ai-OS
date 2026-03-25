@@ -72,7 +72,7 @@ class ContainerManager {
     return this._networkName;
   }
 
-  async spawnWorker(runId) {
+  async spawnWorker(runId, { repo, repoBranch } = {}) {
     // Clean up any orphaned worker containers holding ports before allocating
     await this._cleanOrphanedWorkers();
 
@@ -83,6 +83,10 @@ class ContainerManager {
     const containerName = `claude-worker-${runId}`;
     const volumeName = `workspace-${runId}`;
     const networkName = await this._findNetwork();
+
+    // Per-task repo/branch override (defaults to config)
+    const targetRepo = repo || config.githubRepo;
+    const targetBranch = repoBranch || config.githubBranch;
 
     console.log(`[container] Spawning ${containerName} (backend:${ports.backend} frontend:${ports.frontend} network:${networkName})`);
 
@@ -97,8 +101,8 @@ class ContainerManager {
       Cmd: ["tail", "-f", "/dev/null"], // idle until orchestrator sends work
       Env: [
         `WORKSPACE_DIR=/workspace`,
-        `GITHUB_REPO=${config.githubRepo}`,
-        `GITHUB_BRANCH=${config.githubBranch}`,
+        `GITHUB_REPO=${targetRepo}`,
+        `GITHUB_BRANCH=${targetBranch}`,
         `GITHUB_TOKEN=${config.githubToken}`,
         `PROJECT_NAME=${config.projectName}`,
         `RUN_ID=${runId}`,
