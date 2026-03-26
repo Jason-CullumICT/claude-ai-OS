@@ -702,8 +702,21 @@ ${feedback}`;
 
       // ── Phase 0b: Initialize workspace (skip for retries — volume already has code) ──
       if (isRetry) {
-        console.log(`[${run.id}] RETRY: Skipping workspace init — using existing volume`);
-        // Refresh git + gh credentials in the existing volume
+        console.log(`[${run.id}] RETRY: Reusing existing volume — checking git state`);
+        // Check if git repo is intact, reinit if corrupted
+        const gitCheck = await this.containerManager.execInWorker(containerId, "bash", ["-c",
+          `cd /workspace && git rev-parse --git-dir 2>/dev/null || echo "NOT_A_GIT_REPO"`
+        ], { label: "git-check", quiet: true });
+
+        if (gitCheck.stdout.includes("NOT_A_GIT_REPO")) {
+          console.warn(`[${run.id}] RETRY: Git repo missing/corrupted — reinitializing`);
+          const repoUrl = run.repo || this.config.defaultRepo;
+          await this.containerManager.execInWorker(containerId, "bash", ["-c",
+            `cd /workspace && git init && git remote add origin "${repoUrl}" && git fetch origin ${run.repoBranch || "master"} --depth 1 && git reset --soft FETCH_HEAD 2>/dev/null || true`
+          ], { label: "git-repair", quiet: true });
+        }
+
+        // Refresh git + gh credentials
         await this.containerManager.execInWorker(containerId, "bash", ["-c",
           `cd /workspace && git config user.name "claude-ai-OS" && git config user.email "pipeline@claude-ai-os.local" && echo "https://$GITHUB_TOKEN@github.com" > ~/.git-credentials && git config --global credential.helper store && (echo "$GITHUB_TOKEN" | gh auth login --with-token 2>/dev/null; gh auth setup-git 2>/dev/null) || true`
         ], { label: "git-auth", quiet: true });
@@ -882,12 +895,17 @@ ${feedback}`;
 
         // ── Code change verification: implementation must produce code ──
         if (!isQA && passed) {
-          // Check all forms of changes: unstaged, staged, untracked — case-insensitive Source/ + common alternatives
+          // Try git-based detection first, fall back to filesystem scan if not a git repo
           const diffCheck = await this.containerManager.execInWorker(
             containerId, "bash", ["-c",
               "cd /workspace && " +
-              "{ git diff --name-only 2>/dev/null; git diff --cached --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | " +
-              "grep -iE '^(Source/|src/|backend/|frontend/|lib/|app/|services/|routes/|components/|pages/)' | head -50"
+              "if git rev-parse --git-dir >/dev/null 2>&1; then " +
+              "  { git diff --name-only 2>/dev/null; git diff --cached --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | " +
+              "  grep -iE '^(Source/|src/|backend/|frontend/|lib/|app/|services/|routes/|components/|pages/)' | head -50; " +
+              "else " +
+              "  find . -maxdepth 4 -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.jsx' 2>/dev/null | " +
+              "  grep -iE '/(Source|src|backend|frontend|lib|app|services|routes|components|pages)/' | head -50; " +
+              "fi"
             ],
             { label: "impl-verify", quiet: true }
           );
