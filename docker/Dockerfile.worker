@@ -31,6 +31,9 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get update && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
+# Playwright system dependencies (for E2E tests in pipeline)
+RUN npx playwright install-deps chromium 2>/dev/null || true
+
 # Claude Code
 RUN npm install -g @anthropic-ai/claude-code
 
