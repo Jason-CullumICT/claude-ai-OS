@@ -309,13 +309,31 @@ ${feedback}`;
     };
     const labels = labelMap[run.riskLevel] || labelMap.medium;
 
-    // Create PR via gh CLI
+    // Create PR via gh CLI — use temp files to avoid shell injection
     console.log(`[${run.id}] Creating PR: ${prTitle}`);
-    const prResult = await this.containerManager.execInWorker(
+
+    // Write PR body to temp file to avoid shell escaping issues
+    await this.containerManager.execInWorker(
       containerId, "bash",
-      ["-c", `cd /workspace && gh pr create --title "${prTitle.replace(/"/g, '\\"')}" --body "${prBody.replace(/"/g, '\\"').replace(/\n/g, "\\n")}" --base master --head "cycle/${run.id}" --label "${labels}" 2>&1`],
+      ["-c", `cat > /tmp/pr-body.txt << 'PRBODYEOF'\n${prBody}\nPRBODYEOF`],
+      { label: "pr-body", quiet: true }
+    );
+
+    // Try with labels first, fall back without labels if they don't exist
+    let prResult = await this.containerManager.execInWorker(
+      containerId, "bash",
+      ["-c", `cd /workspace && gh pr create --title "${prTitle.replace(/"/g, '\\"')}" --body-file /tmp/pr-body.txt --base master --head "cycle/${run.id}" --label "${labels}" 2>&1`],
       { label: "pr-create" }
     );
+
+    if (prResult.exitCode !== 0 && prResult.stdout.includes("label")) {
+      console.warn(`[${run.id}] PR creation with labels failed, retrying without labels...`);
+      prResult = await this.containerManager.execInWorker(
+        containerId, "bash",
+        ["-c", `cd /workspace && gh pr create --title "${prTitle.replace(/"/g, '\\"')}" --body-file /tmp/pr-body.txt --base master --head "cycle/${run.id}" 2>&1`],
+        { label: "pr-create-nolabel" }
+      );
+    }
 
     if (prResult.exitCode !== 0) {
       // Verifies: FR-TMP-010 — PR creation failure is non-fatal
@@ -658,9 +676,9 @@ ${feedback}`;
       // ── Phase 0b: Initialize workspace (skip for retries — volume already has code) ──
       if (isRetry) {
         console.log(`[${run.id}] RETRY: Skipping workspace init — using existing volume`);
-        // Refresh git credentials in the existing volume
+        // Refresh git + gh credentials in the existing volume
         await this.containerManager.execInWorker(containerId, "bash", ["-c",
-          `cd /workspace && git config user.name "claude-ai-OS" && git config user.email "pipeline@claude-ai-os.local" && echo "https://${run.repo ? '' : ''}$GITHUB_TOKEN@github.com" > ~/.git-credentials && git config --global credential.helper store`
+          `cd /workspace && git config user.name "claude-ai-OS" && git config user.email "pipeline@claude-ai-os.local" && echo "https://$GITHUB_TOKEN@github.com" > ~/.git-credentials && git config --global credential.helper store && (echo "$GITHUB_TOKEN" | gh auth login --with-token 2>/dev/null; gh auth setup-git 2>/dev/null) || true`
         ], { label: "git-auth", quiet: true });
       } else {
         console.log(`[${run.id}] Initializing workspace in worker...`);
@@ -834,6 +852,81 @@ ${feedback}`;
         saveRunFn(run);
 
         console.log(`[${run.id}] Stage ${stage.name}: ${passed ? "PASSED" : "FAILED"}`);
+
+        // ── Source/ change verification: implementation must produce code ──
+        if (!isQA && passed) {
+          const diffCheck = await this.containerManager.execInWorker(
+            containerId, "bash", ["-c", "cd /workspace && git diff --name-only HEAD -- Source/"],
+            { label: "impl-verify", quiet: true }
+          );
+          const stagedCheck = await this.containerManager.execInWorker(
+            containerId, "bash", ["-c", "cd /workspace && git diff --cached --name-only -- Source/"],
+            { label: "impl-verify-staged", quiet: true }
+          );
+          const changedFiles = (diffCheck.stdout + "\n" + stagedCheck.stdout).trim();
+          if (!changedFiles) {
+            console.error(`[${run.id}] Implementation passed (exitCode=0) but NO Source/ files were modified — marking as FAILED`);
+            run.phases[stageKey].status = "failed";
+            run.phases[stageKey].noSourceChanges = true;
+            passed = false;
+            // Inject feedback so the feedback loop can re-run with a clear message
+            for (const ar of agentResults) {
+              ar.exitCode = 1;
+              ar.outputTail += "\n\nFAILED: No Source/ files were modified. You MUST edit Source/ files to implement the assigned FRs. Writing plans, reports, or analysis is NOT sufficient — you must write code.";
+            }
+            saveRunFn(run);
+          } else {
+            console.log(`[${run.id}] Implementation verified: Source/ files changed:\n${changedFiles}`);
+          }
+        }
+
+        // ── Feedback loop: Implementation failed (no Source/ changes) -> re-run implementation ──
+        if (!isQA && !passed && run.phases[stageKey].noSourceChanges && feedbackLoops < this.config.maxFeedbackLoops) {
+          feedbackLoops++;
+          console.log(`[${run.id}] Feedback loop ${feedbackLoops}/${this.config.maxFeedbackLoops}: No Source/ changes -> re-run implementation`);
+
+          const feedback = agentResults
+            .map((ar) => `-- ${ar.role} --\n${ar.outputTail.slice(-1000)}`)
+            .join("\n\n");
+
+          const fbImplKey = `feedback_${feedbackLoops}_${stage.name}`;
+          run.status = "implementing";
+          run.phases[fbImplKey] = { status: "running", startedAt: ts(), agents: {} };
+          saveRunFn(run);
+
+          this.registry.update(run.id, {
+            status: "implementing",
+            currentPhase: fbImplKey,
+            phaseStartedAt: ts(),
+          });
+
+          const implResult = await this.executeStageInWorker(containerId, stage, feedback);
+
+          for (const ar of implResult.agentResults) {
+            run.phases[fbImplKey].agents[ar.role] = {
+              status: ar.exitCode === 0 ? "passed" : "failed",
+              exitCode: ar.exitCode,
+              outputTail: ar.outputTail,
+            };
+          }
+          run.phases[fbImplKey].status = implResult.passed ? "passed" : "failed";
+          run.phases[fbImplKey].completedAt = ts();
+          saveRunFn(run);
+
+          // Re-check for Source/ changes after retry
+          if (implResult.passed) {
+            const retryDiff = await this.containerManager.execInWorker(
+              containerId, "bash", ["-c", "cd /workspace && git diff --name-only HEAD -- Source/ && git diff --cached --name-only -- Source/"],
+              { label: "impl-retry-verify", quiet: true }
+            );
+            if (!retryDiff.stdout.trim()) {
+              console.error(`[${run.id}] Feedback loop ${feedbackLoops}: Still no Source/ changes after retry`);
+              run.phases[fbImplKey].status = "failed";
+              run.phases[fbImplKey].noSourceChanges = true;
+              saveRunFn(run);
+            }
+          }
+        }
 
         // ── Feedback loop: QA failed -> re-run implementation + QA ──
         if (isQA && !passed && feedbackLoops < this.config.maxFeedbackLoops && lastImplStageIdx >= 0) {
@@ -1186,19 +1279,31 @@ ${feedback}`;
       }
 
       // ── Phase 9: Auto-update portal if this cycle targeted the portal repo ──
+      // Only trigger if actual Source/ code was committed (not just plans/reports)
       if (run.status === "complete" && run.repo) {
         const isPortalRepo = run.repo.includes("container-test");
         if (isPortalRepo) {
-          console.log(`[${run.id}] Updating portal with latest code...`);
-          try {
-            const resp = await fetch(`http://localhost:${this.config.port || 8080}/api/portal/update`, {
-              method: "POST",
-            });
-            if (resp.ok) {
-              console.log(`[${run.id}] Portal updated successfully`);
+          // Verify Source/ files were actually changed before updating portal
+          const sourceCheck = await this.containerManager.execInWorker(
+            containerId, "bash", ["-c", `cd /workspace && git diff --name-only ${run.repoBranch || "master"}..HEAD -- Source/`],
+            { label: "portal-gate", quiet: true }
+          );
+          const hasSourceChanges = sourceCheck.stdout.trim().length > 0;
+
+          if (hasSourceChanges) {
+            console.log(`[${run.id}] Updating portal with latest code (${sourceCheck.stdout.trim().split('\n').length} Source/ files changed)...`);
+            try {
+              const resp = await fetch(`http://localhost:${this.config.port || 8080}/api/portal/update`, {
+                method: "POST",
+              });
+              if (resp.ok) {
+                console.log(`[${run.id}] Portal updated successfully`);
+              }
+            } catch (err) {
+              console.warn(`[${run.id}] Portal update failed: ${err.message}`);
             }
-          } catch (err) {
-            console.warn(`[${run.id}] Portal update failed: ${err.message}`);
+          } else {
+            console.log(`[${run.id}] Skipping portal update — no Source/ files changed (plans/reports only)`);
           }
         }
       }

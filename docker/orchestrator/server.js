@@ -563,9 +563,7 @@ app.post("/api/portal/update", async (req, res) => {
     const { execFileSync } = require("child_process");
 
     // Find the portal container
-    const containers = await dockerClient.listContainers({
-      filters: { name: ["portal"] },
-    });
+    const containers = await dockerClient.listContainers({ name: ["portal"] });
     const portal = containers.find((c) => c.Names.some((n) => n.includes("portal")));
     if (!portal) {
       return res.status(404).json({ error: "Portal container not found" });

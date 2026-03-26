@@ -20,6 +20,13 @@ mkdir -p ~/.git-credentials 2>/dev/null && rmdir ~/.git-credentials 2>/dev/null 
 echo "$CLONE_URL" > ~/.git-credentials
 git config --global credential.helper store
 
+# ── GitHub CLI auth (for PR creation and auto-merge) ────────────────────────
+if command -v gh &>/dev/null && [ -n "$GITHUB_TOKEN" ]; then
+  echo "$GITHUB_TOKEN" | gh auth login --with-token 2>/dev/null || true
+  gh auth setup-git 2>/dev/null || true
+  echo "[setup] GitHub CLI authenticated"
+fi
+
 # ── Clone if workspace is empty ──────────────────────────────────────────────
 if [ ! -d "$WORKSPACE/.git" ]; then
   echo "[setup] Cloning $GITHUB_BRANCH into $WORKSPACE..."

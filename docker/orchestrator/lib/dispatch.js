@@ -68,8 +68,12 @@ function createDispatcher(runClaudeFn, workspace) {
   async function extractRoles(dispatchContent, leaderOutput) {
     const roles = new Set();
 
-    // Extract from markdown headings: ## backend-coder-1, ### frontend-coder
-    for (const m of dispatchContent.matchAll(/^#{2,4}\s+(?:\*\*)?([a-z][\w-]+(?:-\d+)?)(?:\*\*)?/gim)) {
+    // Extract from markdown headings: ## backend-coder-1, ### frontend-coder, ### Agent: backend-coder-1
+    for (const m of dispatchContent.matchAll(/^#{2,4}\s+(?:Agent:\s*)?(?:\*\*)?([a-z][\w-]+(?:-\d+)?)(?:\*\*)?/gim)) {
+      roles.add(m[1].toLowerCase());
+    }
+    // Also match "### Agent: role-name (description)" where role is after "Agent:"
+    for (const m of dispatchContent.matchAll(/^#{2,4}\s+Agent:\s*(?:\*\*)?([a-z][\w-]+(?:-\d+)?)(?:\*\*)?/gim)) {
       roles.add(m[1].toLowerCase());
     }
     // From bold table cells: | **backend-coder-1** |
@@ -211,17 +215,21 @@ test.describe('Feature: {name}', () => {
       const roles = await extractRoles(dpContent, leaderOutput);
       console.log(`[dispatch] Roles: impl=[${(roles.implementation || []).join(", ")}] qa=[${(roles.qa || []).join(", ")}]`);
 
-      const stages = [];
-      if (roles.implementation && roles.implementation.length > 0) {
-        stages.push({
-          name: "implementation",
-          parallel: roles.implementation.length > 1,
-          agents: roles.implementation.map((role) => ({
-            role,
-            prompt: buildAgentPrompt(role, task, team, planCtx, runId),
-          })),
-        });
+      // Guard: every task needs at least one implementation agent
+      if (!roles.implementation || roles.implementation.length === 0) {
+        console.error(`[dispatch] FATAL: No implementation agents found in dispatch plan. Roles extracted: ${JSON.stringify(roles)}`);
+        throw new Error("Dispatch plan has no implementation agents (no coder/fixer roles). The leader must include at least one coder or fixer agent in the dispatch plan.");
       }
+
+      const stages = [];
+      stages.push({
+        name: "implementation",
+        parallel: roles.implementation.length > 1,
+        agents: roles.implementation.map((role) => ({
+          role,
+          prompt: buildAgentPrompt(role, task, team, planCtx, runId),
+        })),
+      });
       if (roles.qa && roles.qa.length > 0) {
         stages.push({
           name: "qa",

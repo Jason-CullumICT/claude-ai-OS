@@ -27,6 +27,15 @@ Your ONLY job is to:
 The orchestrator will parse your output and dispatch the agents for you.
 Do NOT spawn agents via the Agent tool — the orchestrator handles dispatch.
 
+DISPATCH PLAN FILE REQUIREMENT:
+You MUST write your dispatch plan to Plans/<task-slug>/dispatch-plan.md (the file MUST be named dispatch-plan.md).
+The orchestrator looks for this exact filename. If you write plan.md instead, it will NOT be found.
+Your dispatch plan MUST include implementation agent headings using this exact format:
+  ### frontend-coder-1
+  ### backend-coder-1
+Do NOT use '### Agent: name' format — use the role name directly as the heading.
+You MUST include at least one coder agent in your dispatch plan.
+
 Task context:
 Implement: ${TASK}
 $([ -n "$PLAN_FILE" ] && echo "Plan file: ${PLAN_FILE}")
@@ -46,6 +55,14 @@ Your ONLY job is to:
 3. Output structured dispatch instructions for fixer and verification agents
 The orchestrator will parse your output and dispatch the agents for you.
 Do NOT spawn agents via the Agent tool — the orchestrator handles dispatch.
+
+DISPATCH PLAN FILE REQUIREMENT:
+You MUST write your dispatch plan to Plans/<task-slug>/dispatch-plan.md (the file MUST be named dispatch-plan.md).
+The orchestrator looks for this exact filename. If you write plan.md instead, it will NOT be found.
+Your dispatch plan MUST include fixer agent headings using this exact format:
+  ### backend-fixer-1
+  ### frontend-fixer-1
+Do NOT use '### Agent: name' format — use the role name directly as the heading.
 
 Task context:
 Fix: ${TASK}
