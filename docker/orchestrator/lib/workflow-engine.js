@@ -864,7 +864,7 @@ ${feedback}`;
 
         console.log(`[${run.id}] Stage ${i + 1}/${dispatchPlan.stages.length}: ${stage.name} (${stage.agents.length} agent(s), parallel=${stage.parallel})`);
 
-        const { passed, agentResults } = await this.executeStageInWorker(containerId, stage);
+        let { passed, agentResults } = await this.executeStageInWorker(containerId, stage);
 
         // Record per-agent results
         for (const ar of agentResults) {
