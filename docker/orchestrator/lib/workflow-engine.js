@@ -882,15 +882,17 @@ ${feedback}`;
 
         // ── Source/ change verification: implementation must produce code ──
         if (!isQA && passed) {
+          // Check all forms of changes: unstaged, staged, and untracked new files
           const diffCheck = await this.containerManager.execInWorker(
-            containerId, "bash", ["-c", "cd /workspace && git diff --name-only HEAD -- Source/"],
+            containerId, "bash", ["-c",
+              "cd /workspace && " +
+              "git diff --name-only -- Source/ 2>/dev/null; " +
+              "git diff --cached --name-only -- Source/ 2>/dev/null; " +
+              "git ls-files --others --exclude-standard Source/ 2>/dev/null"
+            ],
             { label: "impl-verify", quiet: true }
           );
-          const stagedCheck = await this.containerManager.execInWorker(
-            containerId, "bash", ["-c", "cd /workspace && git diff --cached --name-only -- Source/"],
-            { label: "impl-verify-staged", quiet: true }
-          );
-          const changedFiles = (diffCheck.stdout + "\n" + stagedCheck.stdout).trim();
+          const changedFiles = diffCheck.stdout.trim();
           if (!changedFiles) {
             console.error(`[${run.id}] Implementation passed (exitCode=0) but NO Source/ files were modified — marking as FAILED`);
             run.phases[stageKey].status = "failed";
@@ -943,7 +945,12 @@ ${feedback}`;
           // Re-check for Source/ changes after retry
           if (implResult.passed) {
             const retryDiff = await this.containerManager.execInWorker(
-              containerId, "bash", ["-c", "cd /workspace && git diff --name-only HEAD -- Source/ && git diff --cached --name-only -- Source/"],
+              containerId, "bash", ["-c",
+                "cd /workspace && " +
+                "git diff --name-only -- Source/ 2>/dev/null; " +
+                "git diff --cached --name-only -- Source/ 2>/dev/null; " +
+                "git ls-files --others --exclude-standard Source/ 2>/dev/null"
+              ],
               { label: "impl-retry-verify", quiet: true }
             );
             if (!retryDiff.stdout.trim()) {
