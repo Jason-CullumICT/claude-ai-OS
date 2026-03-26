@@ -65,6 +65,13 @@ if [ ! -d "$WORKSPACE/Teams" ] && [ -d "$TEMPLATE_DIR/Teams" ]; then
   echo "[setup] Framework bootstrapped"
 fi
 
+# ── Ensure .gitignore excludes build artifacts ───────────────────────────────
+for pattern in ".playwright/" "node_modules/" "*.db-shm" "*.db-wal"; do
+  grep -qxF "$pattern" "$WORKSPACE/.gitignore" 2>/dev/null || echo "$pattern" >> "$WORKSPACE/.gitignore"
+done
+git add .gitignore 2>/dev/null
+git diff --cached --quiet || git commit -m "chore: update .gitignore with build artifacts" 2>/dev/null || true
+
 # ── Delete stale remote branch if it exists ──────────────────────────────────
 git push origin --delete "cycle/$RUN_ID" 2>/dev/null || true
 

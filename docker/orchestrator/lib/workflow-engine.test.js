@@ -423,7 +423,8 @@ describe("_autoMerge (FR-TMP-006)", () => {
     const deps = createMockDeps({
       containerManager: {
         execInWorker: async (_cid, cmd, args, opts) => {
-          if (opts && opts.label === "pr-merge") return { exitCode: 1, stdout: "merge conflict" };
+          if (opts && (opts.label === "pr-merge" || opts.label === "pr-merge-retry")) return { exitCode: 1, stdout: "merge conflict" };
+          if (opts && opts.label === "pr-rebase") return { exitCode: 1, stdout: "rebase conflict" };
           return { exitCode: 0, stdout: "" };
         },
       },

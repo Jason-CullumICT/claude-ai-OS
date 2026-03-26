@@ -524,15 +524,42 @@ ${feedback}`;
         run.pr.status = "merged";
         console.log(`[${run.id}] PR #${run.pr.number} merged successfully`);
       } else {
-        // Verifies: FR-TMP-010 — merge conflict handling
-        console.warn(`[${run.id}] Merge failed: ${mergeResult.stdout.slice(-500)}`);
-        run.pr.status = "merge-conflict";
-        // Label the PR with merge-conflict
-        await this.containerManager.execInWorker(
+        // Verifies: FR-TMP-010 — merge conflict: try rebase then retry merge
+        console.warn(`[${run.id}] Merge failed, attempting rebase on master...`);
+        const rebaseResult = await this.containerManager.execInWorker(
           containerId, "bash",
-          ["-c", `cd /workspace && gh pr edit ${run.pr.number} --add-label "merge-conflict" 2>&1 || true`],
-          { label: "pr-label", quiet: true }
+          ["-c", `cd /workspace && git fetch origin master && git rebase origin/master 2>&1 && git push origin "cycle/${run.id}" --force 2>&1`],
+          { label: "pr-rebase" }
         );
+
+        if (rebaseResult.exitCode === 0) {
+          console.log(`[${run.id}] Rebase succeeded, retrying merge...`);
+          const retryMerge = await this.containerManager.execInWorker(
+            containerId, "bash",
+            ["-c", `cd /workspace && gh pr merge ${run.pr.number} --squash --delete-branch 2>&1`],
+            { label: "pr-merge-retry" }
+          );
+          if (retryMerge.exitCode === 0) {
+            run.pr.status = "merged";
+            console.log(`[${run.id}] PR #${run.pr.number} merged after rebase`);
+          } else {
+            console.warn(`[${run.id}] Merge still failed after rebase: ${retryMerge.stdout.slice(-500)}`);
+            run.pr.status = "merge-conflict";
+            await this.containerManager.execInWorker(
+              containerId, "bash",
+              ["-c", `cd /workspace && gh pr edit ${run.pr.number} --add-label "merge-conflict" 2>&1 || true`],
+              { label: "pr-label", quiet: true }
+            );
+          }
+        } else {
+          console.warn(`[${run.id}] Rebase failed: ${rebaseResult.stdout.slice(-500)}`);
+          run.pr.status = "merge-conflict";
+          await this.containerManager.execInWorker(
+            containerId, "bash",
+            ["-c", `cd /workspace && git rebase --abort 2>/dev/null; gh pr edit ${run.pr.number} --add-label "merge-conflict" 2>&1 || true`],
+            { label: "pr-label", quiet: true }
+          );
+        }
       }
     } else {
       run.pr.status = newStatus;

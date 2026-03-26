@@ -361,7 +361,10 @@ wait
     console.log(`[container] Committing and pushing cycle/${runId}...`);
     const result = await this.docker.execInContainer(
       containerId, "bash", ["-c",
-        `cd /workspace && git add -A && ` +
+        `cd /workspace && ` +
+        `git rm -r --cached .playwright/ 2>/dev/null || true && ` +
+        `git reset HEAD -- '*.db-shm' '*.db-wal' 2>/dev/null || true && ` +
+        `git add -A && ` +
         `git diff --cached --quiet || git commit -m "${message}" && ` +
         `git push origin "cycle/${runId}"`
       ],
