@@ -555,6 +555,75 @@ app.post("/api/worker-image/rebuild", async (req, res) => {
   }
 });
 
+// ── Repo Validation & Creation ──
+
+app.post("/api/repos/validate", async (req, res) => {
+  const { repo } = req.body;
+  if (!repo) return res.status(400).json({ error: "Missing field: repo" });
+
+  // Accept full URL or owner/name shorthand
+  const repoMatch = repo.match(/(?:github\.com\/)?([^\/]+\/[^\/\s]+?)(?:\.git)?$/);
+  if (!repoMatch) return res.status(400).json({ error: "Invalid repo format. Use owner/repo or full GitHub URL." });
+  const fullName = repoMatch[1];
+
+  try {
+    const token = config.githubToken;
+    if (!token) return res.status(500).json({ error: "GITHUB_TOKEN not configured" });
+
+    const headers = { Authorization: `token ${token}`, Accept: "application/vnd.github.v3+json" };
+
+    // Check if repo exists via GitHub API
+    const checkResp = await fetch(`https://api.github.com/repos/${fullName}`, { headers });
+    if (checkResp.ok) {
+      return res.json({ exists: true, repo: `https://github.com/${fullName}`, fullName });
+    }
+
+    if (checkResp.status !== 404) {
+      return res.status(500).json({ error: `GitHub API error: ${checkResp.status}` });
+    }
+
+    // Repo doesn't exist — create it
+    console.log(`[repos] Creating repo ${fullName}...`);
+    const [owner, repoName] = fullName.split("/");
+
+    // Try org create first, fall back to user create
+    let createResp = await fetch(`https://api.github.com/orgs/${owner}/repos`, {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: repoName, auto_init: true }),
+    });
+
+    if (!createResp.ok && createResp.status === 404) {
+      // Not an org — create as user repo
+      createResp = await fetch(`https://api.github.com/user/repos`, {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({ name: repoName, auto_init: true }),
+      });
+    }
+
+    if (!createResp.ok) {
+      const err = await createResp.json();
+      return res.status(500).json({ error: `Failed to create repo: ${err.message || JSON.stringify(err)}` });
+    }
+
+    console.log(`[repos] Created: ${fullName}`);
+    return res.json({ exists: false, created: true, repo: `https://github.com/${fullName}`, fullName });
+  } catch (err) {
+    console.error(`[repos] Validation/creation failed:`, err.message);
+    return res.status(500).json({ error: `Failed to validate/create repo: ${err.message}` });
+  }
+});
+
+app.get("/api/repos/list", (req, res) => {
+  // Return known repos — can be extended to scan GitHub later
+  const knownRepos = [
+    { name: "container-test", fullName: "Jason-CullumICT/container-test", url: "https://github.com/Jason-CullumICT/container-test" },
+    { name: "claude-ai-OS", fullName: "Jason-CullumICT/claude-ai-OS", url: "https://github.com/Jason-CullumICT/claude-ai-OS" },
+  ];
+  res.json({ data: knownRepos });
+});
+
 // ── Portal Update ──
 
 app.post("/api/portal/update", async (req, res) => {
