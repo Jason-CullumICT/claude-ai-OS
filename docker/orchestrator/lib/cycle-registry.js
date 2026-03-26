@@ -56,7 +56,9 @@ class CycleRegistry {
         try {
           const status = await dockerClient.getContainerStatus(containerName);
           containerAlive = status === "running";
-        } catch {}
+        } catch (err) {
+          console.log(`[cycles] Container status check for ${containerName}: ${err.message}`);
+        }
       }
 
       if (containerAlive) {

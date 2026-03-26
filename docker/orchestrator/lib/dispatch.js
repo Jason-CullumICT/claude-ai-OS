@@ -39,7 +39,9 @@ function createDispatcher(runClaudeFn, workspace) {
         for (const f of readdirSync(specsDir)) {
           if (f.endsWith(".md")) ctx.specs.push(`Specifications/${f}`);
         }
-      } catch {}
+      } catch (err) {
+        console.warn(`[dispatch] Failed to scan Specifications/: ${err.message}`);
+      }
     }
 
     const plansDir = join(workspace, "Plans");
@@ -55,7 +57,9 @@ function createDispatcher(runClaudeFn, workspace) {
             else if (f.endsWith(".md")) ctx.plans.push(rel);
           }
         }
-      } catch {}
+      } catch (err) {
+        console.warn(`[dispatch] Failed to scan Plans/: ${err.message}`);
+      }
     }
 
     return ctx;

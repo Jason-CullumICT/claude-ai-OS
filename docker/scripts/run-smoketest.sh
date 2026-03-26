@@ -196,13 +196,44 @@ fi
 
 # ── Run Playwright if available ──
 if [[ -d "$WORKSPACE/Source/E2E" ]]; then
+  # Prefer smoke config; fall back to generating a pipeline config that skips webServer.
+  # The project's playwright.config.ts has webServer entries that conflict with the
+  # pipeline (this script already starts the app on known ports).
   PLAYWRIGHT_CONFIG=""
-  for cfg in "playwright.smoke.config.ts" "playwright.config.ts" "playwright.smoke.config.js" "playwright.config.js"; do
+  for cfg in "playwright.smoke.config.ts" "playwright.smoke.config.js"; do
     if [[ -f "$WORKSPACE/Source/E2E/$cfg" ]]; then
       PLAYWRIGHT_CONFIG="$cfg"
       break
     fi
   done
+
+  # If no smoke-specific config, generate one that targets the already-running app
+  if [[ -z "$PLAYWRIGHT_CONFIG" ]]; then
+    HAS_TESTS=false
+    for cfg in "playwright.config.ts" "playwright.config.js"; do
+      if [[ -f "$WORKSPACE/Source/E2E/$cfg" ]]; then
+        HAS_TESTS=true
+        break
+      fi
+    done
+
+    if $HAS_TESTS; then
+      echo "[smoketest] Generating pipeline Playwright config (skips webServer)..."
+      cat > "$WORKSPACE/Source/E2E/playwright.pipeline.config.ts" << PIPELINECFG
+import { defineConfig } from '@playwright/test';
+export default defineConfig({
+  testDir: './tests',
+  timeout: 30000,
+  retries: 1,
+  use: {
+    baseURL: '${FRONTEND_URL}',
+    headless: true,
+  },
+});
+PIPELINECFG
+      PLAYWRIGHT_CONFIG="playwright.pipeline.config.ts"
+    fi
+  fi
 
   if [[ -n "$PLAYWRIGHT_CONFIG" ]] && ($BACKEND_STARTED || $FRONTEND_STARTED); then
     echo ""

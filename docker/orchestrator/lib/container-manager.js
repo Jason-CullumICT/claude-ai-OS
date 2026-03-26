@@ -50,7 +50,10 @@ class ContainerManager {
       const volumes = await this.docker.docker.listVolumes();
       const match = (volumes.Volumes || []).find((v) => v.Name.includes("claude-config"));
       if (match) this._claudeConfigVolume = match.Name;
-    } catch {}
+    } catch (err) {
+      // Fallback below handles this — log for visibility
+      console.log(`[container] Claude config volume lookup failed: ${err.message}`);
+    }
     if (!this._claudeConfigVolume) this._claudeConfigVolume = "docker_claude-config";
     console.log(`[container] Claude config volume: ${this._claudeConfigVolume}`);
   }
@@ -66,13 +69,16 @@ class ContainerManager {
         this._networkName = match.Name;
         return this._networkName;
       }
-    } catch {}
+    } catch (err) {
+      // Fallback below handles this — log for visibility
+      console.log(`[container] Network lookup failed: ${err.message}`);
+    }
     // Fallback: try common patterns
     this._networkName = "docker_claude-net";
     return this._networkName;
   }
 
-  async spawnWorker(runId, { repo, repoBranch } = {}) {
+  async spawnWorker(runId, { repo, repoBranch, credentialsJson } = {}) {
     // Clean up any orphaned worker containers holding ports before allocating
     await this._cleanOrphanedWorkers();
 
@@ -91,7 +97,10 @@ class ContainerManager {
     console.log(`[container] Spawning ${containerName} (backend:${ports.backend} frontend:${ports.frontend} network:${networkName})`);
 
     // Remove any existing container with the same name (stale from previous failed run)
-    try { await this.docker.removeContainer(containerName); } catch {}
+    try { await this.docker.removeContainer(containerName); } catch (err) {
+      // Expected: container doesn't exist yet
+      console.log(`[container] Stale cleanup for ${containerName}: ${err.reason || err.message}`);
+    }
 
     await this.docker.createVolume(volumeName);
 
@@ -143,7 +152,7 @@ class ContainerManager {
     console.log(`[container] ${containerName} started (id: ${container.id.slice(0, 12)})`);
 
     // Inject Claude credentials from orchestrator into worker
-    await this._injectCredentials(container.id);
+    await this._injectCredentials(container.id, credentialsJson);
 
     return {
       containerId: container.id,
@@ -154,13 +163,27 @@ class ContainerManager {
   }
 
   /**
-   * Inject fresh credentials into a worker. Called at spawn AND before each agent exec
+   * Inject credentials into a worker. Called at spawn AND before each agent exec
    * to handle token refresh during long-running cycles.
+   *
+   * @param {string} containerId
+   * @param {string} [credentialsJson] — pre-resolved credentials JSON from token pool.
+   *   If not provided, falls back to reading the host credentials file.
    */
-  async refreshCredentials(containerId) {
-    const credPath = "/root/.claude/.credentials.json";
+  async refreshCredentials(containerId, credentialsJson) {
+    let creds = credentialsJson;
+    if (!creds) {
+      // Fallback: read from host credentials file (legacy path)
+      const credPath = "/root/.claude/.credentials.json";
+      try {
+        creds = readFileSync(credPath, "utf-8");
+      } catch (err) {
+        console.warn(`[container] No credentials to inject: ${err.message}`);
+        return;
+      }
+    }
+
     try {
-      const creds = readFileSync(credPath, "utf-8");
       await this.docker.execInContainer(
         containerId, "bash", ["-c",
           `mkdir -p /root/.claude && cat > /root/.claude/.credentials.json << 'CREDEOF'\n${creds}\nCREDEOF\nchmod 600 /root/.claude/.credentials.json`
@@ -168,20 +191,20 @@ class ContainerManager {
         { label: "auth", quiet: true }
       );
     } catch (err) {
-      console.warn(`[container] Credential refresh failed: ${err.message}`);
+      console.warn(`[container] Credential injection failed: ${err.message}`);
     }
   }
 
   // Keep backward compat
-  async _injectCredentials(containerId) {
-    return this.refreshCredentials(containerId);
+  async _injectCredentials(containerId, credentialsJson) {
+    return this.refreshCredentials(containerId, credentialsJson);
   }
 
   /**
    * Spawn a worker reusing an existing volume (for retry of failed runs).
    * Skips clone + npm install since the volume already has the code.
    */
-  async spawnWorkerFromVolume(runId, existingVolumeName, { repo, repoBranch } = {}) {
+  async spawnWorkerFromVolume(runId, existingVolumeName, { repo, repoBranch, credentialsJson } = {}) {
     await this._cleanOrphanedWorkers();
 
     const ports = this.ports.allocate(runId);
@@ -196,7 +219,10 @@ class ContainerManager {
 
     console.log(`[container] Spawning ${containerName} from existing volume ${existingVolumeName}`);
 
-    try { await this.docker.removeContainer(containerName); } catch {}
+    try { await this.docker.removeContainer(containerName); } catch (err) {
+      // Expected: container doesn't exist yet
+      console.log(`[container] Stale cleanup for ${containerName}: ${err.reason || err.message}`);
+    }
 
     const container = await this.docker.createContainer({
       Image: config.workerImage,
@@ -233,7 +259,7 @@ class ContainerManager {
     }
 
     console.log(`[container] ${containerName} started from volume (id: ${container.id.slice(0, 12)})`);
-    await this.refreshCredentials(container.id);
+    await this.refreshCredentials(container.id, credentialsJson);
 
     return {
       containerId: container.id,
@@ -329,10 +355,13 @@ wait
 
     // Start supervisor — it runs as a background process inside the container
     // The key: we DON'T wait for it to complete (it runs forever via `wait`)
+    // But we DO log if the exec itself fails (e.g., container gone, script missing)
     this.docker.execInContainer(
       containerId, "bash", ["-c", "nohup /tmp/app-supervisor.sh > /tmp/supervisor.log 2>&1 &"],
       { label: "app:supervisor", quiet: true }
-    ).catch(() => {}); // Fire and forget — the exec returns when bash exits but supervisor keeps running
+    ).catch((err) => {
+      console.error(`[container] App supervisor failed to start: ${err.message}`);
+    });
 
     // Give apps time to start
     await new Promise(r => setTimeout(r, 5000));
@@ -359,14 +388,19 @@ wait
 
   async commitAndPush(containerId, runId, message) {
     console.log(`[container] Committing and pushing cycle/${runId}...`);
+    // Sanitize message for shell safety: escape double quotes, strip control chars
+    const safeMsg = message.replace(/"/g, '\\"').replace(/[\r\n]+/g, ' ');
     const result = await this.docker.execInContainer(
       containerId, "bash", ["-c",
         `cd /workspace && ` +
         `git rm -r --cached .playwright/ 2>/dev/null || true && ` +
         `git reset HEAD -- '*.db-shm' '*.db-wal' 2>/dev/null || true && ` +
         `git add -A && ` +
-        `git diff --cached --quiet || git commit -m "${message}" && ` +
-        `git push origin "cycle/${runId}"`
+        // Use subshell grouping to fix operator precedence:
+        // only push if commit succeeds (or nothing to commit)
+        `if ! git diff --cached --quiet 2>/dev/null; then ` +
+        `git commit -m "${safeMsg}" && git push origin "cycle/${runId}"; ` +
+        `else echo "No staged changes to commit"; fi`
       ],
       { label: "git", quiet: true }
     );
@@ -396,7 +430,10 @@ wait
           timeout: 10000,
         });
         console.log(`[container] Branch cycle/${runId} deleted from origin`);
-      } catch {}
+      } catch (err) {
+        // Branch may not exist on remote — log but don't fail teardown
+        console.warn(`[container] Branch cycle/${runId} delete failed: ${err.message}`);
+      }
     }
 
     this.ports.release(runId);

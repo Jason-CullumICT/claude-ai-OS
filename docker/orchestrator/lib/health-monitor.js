@@ -79,7 +79,10 @@ class HealthMonitor {
           console.warn(`[health] Disk pressure! ${parts[4]} used — blocking new cycles`);
         }
       }
-    } catch {} // df not available in all containers
+    } catch (err) {
+      // df may not be available in all containers — log once
+      console.log(`[health] Disk check unavailable: ${err.message}`);
+    }
   }
 
   isDiskPressured() {

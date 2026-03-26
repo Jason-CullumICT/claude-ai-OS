@@ -238,8 +238,16 @@ app.post("/api/work", upload.array("images", 10), async (req, res) => {
     return res.status(503).json({ error: "Orchestrator not initialized — Docker not available" });
   }
 
-  const { task, planFile, team: forceTeam, repo, repoBranch } = req.body;
+  const { task, planFile, team: forceTeam, repo, repoBranch, claudeSessionToken, tokenLabel } = req.body;
   if (!task) return res.status(400).json({ error: "Missing required field: task" });
+
+  // Resolve Claude session token using priority chain: per-request → host → env
+  let resolvedToken = null;
+  try {
+    resolvedToken = await tokenPool.resolveToken(claudeSessionToken, tokenLabel);
+  } catch (err) {
+    console.error(`[${Date.now()}] Token resolution failed: ${err.message}`);
+  }
 
   const run = {
     id: `run-${Date.now()}-${randomUUID().slice(0, 8)}`,
@@ -248,6 +256,8 @@ app.post("/api/work", upload.array("images", 10), async (req, res) => {
     planFile: planFile || null,
     repo: repo || config.githubRepo,           // per-task repo override
     repoBranch: repoBranch || config.githubBranch, // per-task branch override
+    tokenSource: resolvedToken?.source || "none",
+    tokenLabel: resolvedToken?.label || "no token",
     team: null,
     teamReason: null,
     attachments: [],
@@ -334,7 +344,7 @@ app.post("/api/work", upload.array("images", 10), async (req, res) => {
       console.log(`[${run.id}] Team: ${team} — ${teamReason}`);
       saveRun(run);
 
-      await workflowEngine.executeWorkflow(run, saveRun);
+      await workflowEngine.executeWorkflow(run, saveRun, resolvedToken);
     } catch (err) {
       console.error(`[${run.id}] Fatal:`, err);
       run.status = "failed";
@@ -445,6 +455,45 @@ app.post("/api/cycles/:id/cleanup", async (req, res) => {
   }
 });
 
+// Delete a run — removes JSON file, volume, branch, and cycle registry entry.
+// Works for any run (active, completed, or failed) regardless of cycle state.
+app.delete("/api/runs/:id", async (req, res) => {
+  const run = loadRun(req.params.id);
+  if (!run) return res.status(404).json({ error: "Run not found" });
+
+  const cleaned = { run: false, volume: false, branch: false, cycle: false };
+
+  // Stop and clean up container/volume/branch if they exist
+  try {
+    await containerManager.teardown(req.params.id, { keepVolume: false, keepBranch: false });
+    cleaned.volume = true;
+    cleaned.branch = true;
+  } catch (err) {
+    // Container/volume may already be gone — that's fine
+    console.log(`[runs] Cleanup for ${req.params.id}: ${err.message}`);
+  }
+
+  // Remove from cycle registry
+  try {
+    cycleRegistry.remove(req.params.id);
+    cleaned.cycle = true;
+  } catch (err) {
+    console.log(`[runs] Cycle registry removal for ${req.params.id}: ${err.message}`);
+  }
+
+  // Delete the run JSON file
+  try {
+    const { unlinkSync } = require("fs");
+    unlinkSync(join(RUNS_DIR, `${req.params.id}.json`));
+    cleaned.run = true;
+  } catch (err) {
+    console.warn(`[runs] Could not delete run file: ${err.message}`);
+  }
+
+  console.log(`[runs] Deleted ${req.params.id}: ${JSON.stringify(cleaned)}`);
+  res.json({ deleted: true, cleaned });
+});
+
 app.get("/api/cycles/:id/logs", async (req, res) => {
   const cycle = cycleRegistry.get(req.params.id);
   if (!cycle || !cycle.containerId) return res.status(404).json({ error: "Cycle not found" });
@@ -534,7 +583,13 @@ app.post("/api/runs/:id/retry", async (req, res) => {
       console.log(`[${run.id}] Retry of ${originalRun.id} — Team: ${team}`);
       saveRun(run);
 
-      await workflowEngine.executeWorkflow(run, saveRun);
+      // Retries re-resolve token (per-request token not persisted, falls back to host/env)
+      const retryToken = await tokenPool.resolveToken();
+      run.tokenSource = retryToken?.source || "none";
+      run.tokenLabel = retryToken?.label || "no token";
+      saveRun(run);
+
+      await workflowEngine.executeWorkflow(run, saveRun, retryToken);
     } catch (err) {
       console.error(`[${run.id}] Retry fatal:`, err);
       run.status = "failed";
@@ -557,61 +612,73 @@ app.post("/api/worker-image/rebuild", async (req, res) => {
 
 // ── Repo Validation & Creation ──
 
-app.post("/api/repos/validate", async (req, res) => {
-  const { repo } = req.body;
-  if (!repo) return res.status(400).json({ error: "Missing field: repo" });
-
-  // Accept full URL or owner/name shorthand
-  const repoMatch = repo.match(/(?:github\.com\/)?([^\/]+\/[^\/\s]+?)(?:\.git)?$/);
-  if (!repoMatch) return res.status(400).json({ error: "Invalid repo format. Use owner/repo or full GitHub URL." });
+/**
+ * Validate a GitHub repo exists, or create it if it doesn't.
+ * Used by both the /api/repos/validate endpoint and the workflow engine.
+ *
+ * @param {string} repoInput — full URL or owner/name shorthand
+ * @returns {{ exists: boolean, created: boolean, repo: string, fullName: string }}
+ * @throws {Error} on validation/creation failure
+ */
+async function validateOrCreateRepo(repoInput) {
+  const repoMatch = repoInput.match(/(?:github\.com\/)?([^\/]+\/[^\/\s]+?)(?:\.git)?$/);
+  if (!repoMatch) throw new Error("Invalid repo format. Use owner/repo or full GitHub URL.");
   const fullName = repoMatch[1];
 
-  try {
-    const token = config.githubToken;
-    if (!token) return res.status(500).json({ error: "GITHUB_TOKEN not configured" });
+  const token = config.githubToken;
+  if (!token) throw new Error("GITHUB_TOKEN not configured");
 
-    const headers = { Authorization: `token ${token}`, Accept: "application/vnd.github.v3+json" };
+  const headers = { Authorization: `token ${token}`, Accept: "application/vnd.github.v3+json" };
 
-    // Check if repo exists via GitHub API
-    const checkResp = await fetch(`https://api.github.com/repos/${fullName}`, { headers });
-    if (checkResp.ok) {
-      return res.json({ exists: true, repo: `https://github.com/${fullName}`, fullName });
-    }
+  // Check if repo exists via GitHub API
+  const checkResp = await fetch(`https://api.github.com/repos/${fullName}`, { headers });
+  if (checkResp.ok) {
+    return { exists: true, created: false, repo: `https://github.com/${fullName}`, fullName };
+  }
 
-    if (checkResp.status !== 404) {
-      return res.status(500).json({ error: `GitHub API error: ${checkResp.status}` });
-    }
+  if (checkResp.status !== 404) {
+    throw new Error(`GitHub API error: ${checkResp.status}`);
+  }
 
-    // Repo doesn't exist — create it
-    console.log(`[repos] Creating repo ${fullName}...`);
-    const [owner, repoName] = fullName.split("/");
+  // Repo doesn't exist — create it
+  console.log(`[repos] Creating repo ${fullName}...`);
+  const [owner, repoName] = fullName.split("/");
 
-    // Try org create first, fall back to user create
-    let createResp = await fetch(`https://api.github.com/orgs/${owner}/repos`, {
+  // Try org create first, fall back to user create
+  let createResp = await fetch(`https://api.github.com/orgs/${owner}/repos`, {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({ name: repoName, auto_init: true }),
+  });
+
+  if (!createResp.ok && createResp.status === 404) {
+    // Not an org — create as user repo
+    createResp = await fetch(`https://api.github.com/user/repos`, {
       method: "POST",
       headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify({ name: repoName, auto_init: true }),
     });
+  }
 
-    if (!createResp.ok && createResp.status === 404) {
-      // Not an org — create as user repo
-      createResp = await fetch(`https://api.github.com/user/repos`, {
-        method: "POST",
-        headers: { ...headers, "Content-Type": "application/json" },
-        body: JSON.stringify({ name: repoName, auto_init: true }),
-      });
-    }
+  if (!createResp.ok) {
+    const errBody = await createResp.json();
+    throw new Error(`Failed to create repo: ${errBody.message || JSON.stringify(errBody)}`);
+  }
 
-    if (!createResp.ok) {
-      const err = await createResp.json();
-      return res.status(500).json({ error: `Failed to create repo: ${err.message || JSON.stringify(err)}` });
-    }
+  console.log(`[repos] Created: ${fullName}`);
+  return { exists: false, created: true, repo: `https://github.com/${fullName}`, fullName };
+}
 
-    console.log(`[repos] Created: ${fullName}`);
-    return res.json({ exists: false, created: true, repo: `https://github.com/${fullName}`, fullName });
+app.post("/api/repos/validate", async (req, res) => {
+  const { repo } = req.body;
+  if (!repo) return res.status(400).json({ error: "Missing field: repo" });
+
+  try {
+    const result = await validateOrCreateRepo(repo);
+    return res.json(result);
   } catch (err) {
     console.error(`[repos] Validation/creation failed:`, err.message);
-    return res.status(500).json({ error: `Failed to validate/create repo: ${err.message}` });
+    return res.status(500).json({ error: err.message });
   }
 });
 
@@ -677,7 +744,9 @@ app.post("/api/portal/update", async (req, res) => {
         ) && nohup $ENTRY > /tmp/backend.log 2>&1 & disown`
       ],
       { label: "portal-backend", quiet: true }
-    ).catch(() => {}); // Fire and forget
+    ).catch((err) => {
+      console.error(`[portal] Backend restart failed: ${err.message}`);
+    });
 
     // Frontend (Vite) hot-reloads automatically — no restart needed
 
@@ -797,12 +866,21 @@ app.get("/", (req, res) => {
       ? `${Math.round((new Date(r.updatedAt) - new Date(r.createdAt)) / 1000)}s`
       : "--";
 
+    const tokenBadge = r.tokenSource === "api"
+      ? `<span style="color:#22c55e" title="${r.tokenLabel || ''}">${(r.tokenLabel || "api").slice(0, 15)}</span>`
+      : r.tokenSource === "host"
+        ? '<span style="color:#7b7f9e">host</span>'
+        : r.tokenSource === "env"
+          ? '<span style="color:#f59e0b">env</span>'
+          : '<span style="color:#ef4444">none</span>';
+
     return `<tr>
       <td><a href="/api/runs/${r.id}">${r.id.slice(-12)}</a></td>
       <td>${teamBadge}</td>
       <td style="color:${color};font-weight:600">${label}${progress}</td>
       <td>${(r.task || "").slice(0, 80)}</td>
       <td>${resultBadge}${feedbackBadge}</td>
+      <td>${tokenBadge}</td>
       <td>${elapsed}</td>
       <td>${new Date(r.createdAt).toLocaleString()}</td>
     </tr>`;
@@ -851,6 +929,15 @@ app.get("/", (req, res) => {
   .stop-btn { background: #7f1d1d; color: #fca5a5; border: 1px solid #ef4444; border-radius: 4px; padding: 0.2rem 0.5rem; cursor: pointer; font-size: 0.75rem; }
   .stop-btn:hover { background: #991b1b; }
   .app-link { color: #22c55e; font-weight: 600; }
+  .submit-form { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: flex-end; margin-bottom: 1rem; }
+  .submit-form .field { display: flex; flex-direction: column; gap: 0.25rem; }
+  .submit-form label { font-size: 0.7rem; color: #7b7f9e; text-transform: uppercase; letter-spacing: 0.05em; }
+  .submit-form input, .submit-form select { background: #1a1d27; border: 1px solid #2a2d3e; border-radius: 4px; color: #e2e4f0; padding: 0.4rem 0.6rem; font-size: 0.85rem; }
+  .submit-form input:focus { border-color: #6366f1; outline: none; }
+  .submit-form input[name="task"] { min-width: 300px; }
+  .submit-form input[name="claudeSessionToken"] { min-width: 200px; font-family: monospace; font-size: 0.75rem; }
+  .submit-form button { background: #6366f1; color: white; border: none; border-radius: 4px; padding: 0.4rem 1rem; cursor: pointer; font-size: 0.85rem; font-weight: 600; }
+  .submit-form button:hover { background: #4f46e5; }
 </style></head><body>
 <h1>claude-ai-OS Pipeline</h1>
 <p class="subtitle">Container-based dispatch: Leader -> Parse -> Code -> QA (feedback loops) -> Validate. Auto-refreshes 10s.</p>
@@ -867,9 +954,25 @@ ${activeCyclesPanel}
   <span><span class="dot" style="background:#22c55e"></span> Complete</span>
   <span><span class="dot" style="background:#ef4444"></span> Failed</span>
 </div>
-${runs.length === 0 ? '<p class="empty">No runs yet. POST to <code>/api/work</code> to submit tasks.</p>' : `
+<div class="panel">
+  <h2>Submit Work</h2>
+  <form class="submit-form" onsubmit="event.preventDefault();
+    const fd = Object.fromEntries(new FormData(this));
+    Object.keys(fd).forEach(k => { if(!fd[k]) delete fd[k]; });
+    fetch('/api/work', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(fd)})
+      .then(r=>r.json()).then(r=>{if(r.id){location.reload()}else{alert(r.error||'Failed')}})
+      .catch(e=>alert(e.message));">
+    <div class="field"><label>Task</label><input name="task" required placeholder="Describe the feature or bug..."></div>
+    <div class="field"><label>Repo (optional)</label><input name="repo" placeholder="owner/repo or URL"></div>
+    <div class="field"><label>Session Token (optional)</label><input name="claudeSessionToken" placeholder="sk-ant-oat01-..." type="password"></div>
+    <div class="field"><label>Token Label</label><input name="tokenLabel" placeholder="e.g. jason's token"></div>
+    <div class="field"><label>Team</label><select name="team"><option value="">Auto-route</option><option value="TheATeam">TheATeam</option><option value="TheFixer">TheFixer</option></select></div>
+    <div class="field"><label>&nbsp;</label><button type="submit">Submit</button></div>
+  </form>
+</div>
+${runs.length === 0 ? '<p class="empty">No runs yet.</p>' : `
 <table>
-  <thead><tr><th>Run</th><th>Team</th><th>Status</th><th>Task</th><th>Result</th><th>Time</th><th>Created</th></tr></thead>
+  <thead><tr><th>Run</th><th>Team</th><th>Status</th><th>Task</th><th>Result</th><th>Token</th><th>Time</th><th>Created</th></tr></thead>
   <tbody>${rows}</tbody>
 </table>`}
 </body></html>`);
@@ -907,6 +1010,7 @@ app.listen(config.port, "0.0.0.0", async () => {
     // Create workflow engine with dispatch
     const engine = new WorkflowEngine({
       containerManager, cycleRegistry, learningsSync, dispatch, config,
+      validateOrCreateRepo,
     });
     setWorkflowEngine(engine);
 

@@ -37,14 +37,20 @@ class DockerClient {
     try {
       const container = this.docker.getContainer(containerId);
       await container.stop({ t: timeout });
-    } catch {}
+    } catch (err) {
+      // Expected when container already stopped or doesn't exist
+      console.log(`[docker] stopContainer ${containerId}: ${err.reason || err.message}`);
+    }
   }
 
   async removeContainer(containerId) {
     try {
       const container = this.docker.getContainer(containerId);
       await container.remove({ force: true });
-    } catch {}
+    } catch (err) {
+      // Expected when container doesn't exist
+      console.log(`[docker] removeContainer ${containerId}: ${err.reason || err.message}`);
+    }
   }
 
   async execInContainer(containerId, cmd, args = [], { label, quiet, env } = {}) {
@@ -117,7 +123,10 @@ class DockerClient {
     try {
       const volume = this.docker.getVolume(name);
       await volume.remove();
-    } catch {}
+    } catch (err) {
+      // Expected when volume doesn't exist or is in use
+      console.log(`[docker] removeVolume ${name}: ${err.reason || err.message}`);
+    }
   }
 
   async getContainerLogs(containerId, follow = false) {

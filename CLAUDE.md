@@ -106,6 +106,13 @@ These are non-negotiable. All agents and solo sessions must follow them.
 - **New routes must have observability** -- structured logging (not console.log), Prometheus metrics for domain-significant operations
 - **Business logic has no framework imports** -- keep domain logic in pure functions/services
 - **Shared type changes affect multiple layers** -- coordinate across layers before editing
+- **No silent failures** -- every operation that can fail must have its outcome checked and logged. This applies to all code, especially orchestration and pipeline code. The specific rules:
+  - **Check return values**: every `await` on a function that can fail must check the result (exit code, status, error). Never fire-and-forget on operations that affect correctness.
+  - **No empty catch blocks**: `catch {}` and `.catch(() => {})` are banned. At minimum, log the error. If the failure is truly ignorable, add a comment explaining *why* and still log at debug/warn level.
+  - **`|| true` requires justification**: only use when the failure is genuinely expected and harmless (e.g., "file may not exist"). Add a comment. Never use `|| true` on git push, git commit, npm install, or any operation where failure means work is lost or state is wrong.
+  - **Bash `||` / `&&` precedence**: never chain `A || B && C` — use explicit `if/then/else` or subshells to make control flow unambiguous.
+  - **Verify before claiming success**: status must only be set to "passed" or "complete" after the outcome is independently verified. "The command returned 0" is necessary but not sufficient for critical operations (e.g., git push must be verified by checking the remote).
+  - **Preserve evidence of failure**: when a critical operation fails (push, commit, deploy), preserve the artifacts (volumes, logs, branches) so the failure can be diagnosed and work recovered.
 
 <!-- Add project-specific rules as needed: -->
 <!-- - **Frontend UI must use [component library]** -- all user-facing UI elements must use the shared component primitives -->

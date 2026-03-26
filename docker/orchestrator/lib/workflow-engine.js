@@ -33,13 +33,15 @@ class WorkflowEngine {
    * @param {import('./learnings-sync').LearningsSync} deps.learningsSync
    * @param {object} deps.dispatch — result of createDispatcher(runClaude, workspace)
    * @param {object} deps.config — lib/config.js
+   * @param {function} [deps.validateOrCreateRepo] — async function to validate/create GitHub repos
    */
-  constructor({ containerManager, cycleRegistry, learningsSync, dispatch, config: cfg }) {
+  constructor({ containerManager, cycleRegistry, learningsSync, dispatch, config: cfg, validateOrCreateRepo }) {
     this.containerManager = containerManager;
     this.registry = cycleRegistry;
     this.learningsSync = learningsSync;
     this.dispatch = dispatch;
     this.config = cfg || config;
+    this.validateOrCreateRepo = validateOrCreateRepo || null;
   }
 
   // ════════════════════════════════════════════════════════════
@@ -114,7 +116,7 @@ ${feedback}`;
     console.log(`    [agent] ${role} starting (in worker)...`);
 
     // Refresh credentials before each agent to handle token expiry during long cycles
-    await this.containerManager.refreshCredentials(containerId);
+    await this.containerManager.refreshCredentials(containerId, this._activeCredentialsJson);
 
     const result = await this.containerManager.execInWorker(
       containerId,
@@ -199,12 +201,36 @@ ${feedback}`;
       { label: "playwright-deps", quiet: true }
     );
 
-    // Run the E2E tests
+    // Generate a pipeline-specific Playwright config that uses the already-running app.
+    // The project's playwright.config.ts has webServer entries that conflict with the
+    // pipeline (app is already running on dynamic ports, not the dev defaults).
+    // Verifies: FR-TMP-003
+    const frontendUrl = run.app?.frontend || "http://localhost:5173";
+    const pipelineConfig = [
+      'import { defineConfig } from "@playwright/test";',
+      'export default defineConfig({',
+      `  testDir: "./tests/cycle-${run.id}",`,
+      '  timeout: 30000,',
+      '  retries: 1,',
+      '  use: {',
+      `    baseURL: "${frontendUrl}",`,
+      '    headless: true,',
+      '  },',
+      '});',
+    ].join('\n');
+
+    await this.containerManager.execInWorker(
+      containerId, "bash",
+      ["-c", `cat > /workspace/Source/E2E/playwright.pipeline.config.ts << 'PIPELINECFG'\n${pipelineConfig}\nPIPELINECFG`],
+      { label: "playwright-config", quiet: true }
+    );
+
+    // Run the E2E tests with the pipeline config (no webServer, uses live app)
     // Verifies: FR-TMP-003
     console.log(`[${run.id}] Running Playwright E2E tests from ${testDir}...`);
     const e2eResult = await this.containerManager.execInWorker(
       containerId, "bash",
-      ["-c", `cd /workspace/Source/E2E && PLAYWRIGHT_BROWSERS_PATH=/workspace/.playwright npx playwright test tests/cycle-${run.id}/ --reporter=json 2>&1`],
+      ["-c", `cd /workspace/Source/E2E && PLAYWRIGHT_BROWSERS_PATH=/workspace/.playwright npx playwright test --config=playwright.pipeline.config.ts --reporter=json 2>&1`],
       { label: "playwright-e2e" }
     );
 
@@ -642,8 +668,13 @@ ${feedback}`;
    *
    * @param {object} run — the run JSON object (id, task, team, planFile, attachments, etc.)
    * @param {function} saveRunFn — callback to persist run state
+   * @param {object} [resolvedToken] — resolved token from TokenPool.resolveToken()
    */
-  async executeWorkflow(run, saveRunFn) {
+  async executeWorkflow(run, saveRunFn, resolvedToken) {
+    // Extract credentials JSON for worker injection (held in memory only, never persisted)
+    // Stored on instance for duration of this workflow so runAgentInWorker can access it
+    this._activeCredentialsJson = resolvedToken?.credentialsJson || null;
+    const credentialsJson = this._activeCredentialsJson;
     // Build image context string for prompts
     const imageContext = run.attachments && run.attachments.length > 0
       ? `\n\nReference images (use the Read tool to view these):\n${run.attachments.map((p) => `- ${p}`).join("\n")}`
@@ -658,7 +689,34 @@ ${feedback}`;
         branch: `cycle/${run.id}`,
       });
 
-      // ── Phase 0: Spawn worker container ──
+      // ── Phase 0a: Validate/create target repo on GitHub ──
+      const targetRepo = run.repo || this.config.githubRepo;
+      if (targetRepo && this.validateOrCreateRepo) {
+        console.log(`[${run.id}] Validating target repo: ${targetRepo}`);
+        try {
+          const repoResult = await this.validateOrCreateRepo(targetRepo);
+          // Normalize repo URL to https://github.com/owner/repo format
+          run.repo = repoResult.repo;
+          run.repoFullName = repoResult.fullName;
+          if (repoResult.created) {
+            console.log(`[${run.id}] Created new repo: ${repoResult.fullName}`);
+            run.repoCreated = true;
+            // New repos have 'main' as default branch
+            if (!run.repoBranch) run.repoBranch = "main";
+          } else {
+            console.log(`[${run.id}] Repo exists: ${repoResult.fullName}`);
+          }
+          saveRunFn(run);
+        } catch (err) {
+          console.error(`[${run.id}] Repo validation/creation failed: ${err.message}`);
+          run.status = "failed";
+          run.results = { error: `Repo setup failed: ${err.message}`, allPassed: false };
+          saveRunFn(run);
+          return;
+        }
+      }
+
+      // ── Phase 0b: Spawn worker container ──
       const isRetry = !!run.reuseVolume;
       let worker;
 
@@ -667,12 +725,14 @@ ${feedback}`;
         worker = await this.containerManager.spawnWorkerFromVolume(run.id, run.reuseVolume, {
           repo: run.repo,
           repoBranch: run.repoBranch,
+          credentialsJson,
         });
       } else {
         console.log(`[${run.id}] Spawning worker container...`);
         worker = await this.containerManager.spawnWorker(run.id, {
           repo: run.repo,
           repoBranch: run.repoBranch,
+          credentialsJson,
         });
       }
       containerId = worker.containerId;
@@ -764,7 +824,7 @@ ${feedback}`;
       });
 
       console.log(`[${run.id}] Phase 1: ${run.team} leader planning (in worker)...`);
-      await this.containerManager.refreshCredentials(containerId);
+      await this.containerManager.refreshCredentials(containerId, credentialsJson);
 
       // Verifies: FR-TMP-001 — enrich task with risk classification instructions for the leader
       const enrichedTask = this.dispatch.enrichTaskForLeader(run.task);
@@ -1251,13 +1311,54 @@ ${feedback}`;
       // It stays running on the worker's allocated ports for user testing.
 
       // ── Phase 6: Commit and push from worker ──
+      // CRITICAL: If this fails, the code only exists in the worker volume.
+      // We must verify the push landed before allowing volume cleanup.
       console.log(`[${run.id}] Committing and pushing...`);
-      const commitMsg = `feat: ${run.task.slice(0, 100)}`;
-      await this.containerManager.commitAndPush(containerId, run.id, commitMsg);
+      const commitMsg = `feat: ${run.task.replace(/[\r\n]+/g, " ").slice(0, 100)}`;
+      const commitResult = await this.containerManager.commitAndPush(containerId, run.id, commitMsg);
+
+      // Verify commits actually reached the remote
+      const commitCheck = await this.containerManager.execInWorker(
+        containerId, "bash",
+        ["-c", `cd /workspace && git log --oneline origin/${this.config.branch}..HEAD 2>/dev/null | wc -l`],
+        { label: "commit-check", quiet: true }
+      );
+      const localCommitCount = parseInt((commitCheck.stdout || "").trim(), 10) || 0;
+
+      // Double-check: verify remote branch has the commits (not just local)
+      const remoteCheck = await this.containerManager.execInWorker(
+        containerId, "bash",
+        ["-c", `cd /workspace && git fetch origin "cycle/${run.id}" 2>/dev/null && git log --oneline "origin/cycle/${run.id}" --not "origin/${this.config.branch}" 2>/dev/null | wc -l`],
+        { label: "remote-verify", quiet: true }
+      );
+      const remoteCommitCount = parseInt((remoteCheck.stdout || "").trim(), 10) || 0;
+
+      run.pushVerified = remoteCommitCount > 0;
+
+      if (localCommitCount > 0 && !run.pushVerified) {
+        // Code exists locally but NOT on remote — this is the "lost work" scenario
+        console.error(`[${run.id}] CRITICAL: ${localCommitCount} local commits but push to remote FAILED. Preserving volume.`);
+        run.results.commitPush = "push_failed";
+        run.pushVerified = false;
+        saveRunFn(run);
+      } else if (localCommitCount === 0) {
+        console.warn(`[${run.id}] No commits created — implementation may not have produced code changes`);
+        run.results.commitPush = "no_commits";
+        saveRunFn(run);
+      } else {
+        console.log(`[${run.id}] Push verified: ${remoteCommitCount} commits on remote`);
+        run.results.commitPush = "verified";
+        saveRunFn(run);
+      }
 
       // ── Phase 6.5: PR creation, AI review, and auto-merge ──
       // Verifies: FR-TMP-004, FR-TMP-005, FR-TMP-006
-      if (this.config.mergeStrategy !== "manual") {
+      if (!run.pushVerified) {
+        console.warn(`[${run.id}] Skipping PR creation — push not verified`);
+        run.pr = { status: "skipped", reason: run.results.commitPush };
+        run.results.pr = "skipped";
+        saveRunFn(run);
+      } else if (this.config.mergeStrategy !== "manual") {
         this.registry.update(run.id, {
           currentPhase: "pr_merge",
           phaseStartedAt: ts(),
@@ -1307,13 +1408,14 @@ ${feedback}`;
           "git stash --include-untracked || true",
           `git checkout ${mainBranch}`,
           `git pull origin ${mainBranch}`,
-          `git checkout cycle/${run.id} -- Teams/*/learnings/*.md Teams/TheATeam/*.md Teams/TheFixer/*.md Teams/TheInspector/*.md Teams/Shared/*.md 2>/dev/null || true`,
-          `git checkout cycle/${run.id} -- CLAUDE.md 2>/dev/null || true`,
+          // Checkout learnings files from cycle branch — pattern may not match, that's expected
+          `git checkout cycle/${run.id} -- Teams/*/learnings/*.md Teams/TheATeam/*.md Teams/TheFixer/*.md Teams/TheInspector/*.md Teams/Shared/*.md 2>/dev/null || echo "[learnings] No team files to sync"`,
+          `git checkout cycle/${run.id} -- CLAUDE.md 2>/dev/null || echo "[learnings] No CLAUDE.md changes"`,
           "git add -A",
-          `git diff --cached --quiet || git commit -m "chore: sync learnings from cycle/${run.id}"`,
-          `git push origin ${mainBranch} || true`,
+          // Fixed: use if/then to avoid bash operator precedence issues
+          `if ! git diff --cached --quiet 2>/dev/null; then git commit -m "chore: sync learnings from cycle/${run.id}" && git push origin ${mainBranch}; else echo "[learnings] Nothing to commit"; fi`,
           `git checkout cycle/${run.id}`,
-          "git stash pop || true",
+          "git stash pop || echo '[learnings] No stash to pop'",
         ].join(" && ");
         const syncResult = await this.containerManager.execInWorker(
           containerId, "bash", ["-c", syncScript],
@@ -1367,16 +1469,26 @@ ${feedback}`;
       });
       saveRunFn(run);
 
-      // Auto-cleanup worker container (keep volume for retries if failed)
+      // Auto-cleanup worker container
+      // CRITICAL: Never delete the volume unless code is confirmed on the remote.
+      // If push wasn't verified, the volume is the ONLY copy of the work.
       try {
-        const keepVolume = run.status !== "complete";
-        console.log(`[${run.id}] Cleaning up worker (status=${run.status}, keepVolume=${keepVolume})...`);
+        const pushSafe = run.pushVerified === true;
+        const keepVolume = !pushSafe || run.status !== "complete";
+        if (!pushSafe) {
+          console.warn(`[${run.id}] Push NOT verified — preserving volume to prevent data loss`);
+        }
+        console.log(`[${run.id}] Cleaning up worker (status=${run.status}, pushVerified=${pushSafe}, keepVolume=${keepVolume})...`);
         await this.containerManager.teardown(run.id, { keepVolume, keepBranch: true });
       } catch (cleanupErr) {
         console.warn(`[${run.id}] Worker cleanup warning: ${cleanupErr.message}`);
       }
 
+      // Clear credentials from memory — token lifecycle ends with the workflow
+      this._activeCredentialsJson = null;
+
     } catch (err) {
+      this._activeCredentialsJson = null; // Clear on error too
       console.error(`[${run.id}] Workflow error:`, err);
       run.status = "failed";
       run.results = { ...run.results, error: err.message, allPassed: false };

@@ -71,7 +71,10 @@ class LearningsSync {
         try {
           this._git(["checkout", `origin/${branch}`, "--", pattern]);
           hasChanges = true;
-        } catch {} // Pattern may not match — that's OK
+        } catch (err) {
+          // Pattern may not match (no learnings files yet) — expected and non-fatal
+          console.log(`[learnings] Pattern ${pattern}: ${err.message.split("\n")[0]}`);
+        }
       }
 
       // Try CLAUDE.md (skip on conflict)
@@ -97,7 +100,9 @@ class LearningsSync {
             console.log(`[learnings] Learnings merged to ${mainBranch} from ${branch}`);
           }
         } catch (err) {
-          console.warn(`[learnings] Commit/push failed: ${err.message}`);
+          console.error(`[learnings] Commit/push failed: ${err.message}`);
+          this.releaseLock();
+          return { success: false, error: `Commit/push failed: ${err.message}` };
         }
       } else {
         console.log("[learnings] No learnings files found in cycle branch");
@@ -108,8 +113,12 @@ class LearningsSync {
     } catch (err) {
       console.error(`[learnings] Sync failed: ${err.message}`);
       // Reset any partial checkout state
-      try { this._git(["checkout", mainBranch]); } catch {}
-      try { this._git(["reset", "--hard", `origin/${mainBranch}`]); } catch {}
+      try { this._git(["checkout", mainBranch]); } catch (resetErr) {
+        console.warn(`[learnings] Recovery checkout failed: ${resetErr.message}`);
+      }
+      try { this._git(["reset", "--hard", `origin/${mainBranch}`]); } catch (resetErr) {
+        console.warn(`[learnings] Recovery reset failed: ${resetErr.message}`);
+      }
       this.releaseLock();
       return { success: false, error: err.message };
     }
