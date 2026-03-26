@@ -880,21 +880,20 @@ ${feedback}`;
 
         console.log(`[${run.id}] Stage ${stage.name}: ${passed ? "PASSED" : "FAILED"}`);
 
-        // ── Source/ change verification: implementation must produce code ──
+        // ── Code change verification: implementation must produce code ──
         if (!isQA && passed) {
-          // Check all forms of changes: unstaged, staged, and untracked new files
+          // Check all forms of changes: unstaged, staged, untracked — case-insensitive Source/ + common alternatives
           const diffCheck = await this.containerManager.execInWorker(
             containerId, "bash", ["-c",
               "cd /workspace && " +
-              "git diff --name-only -- Source/ 2>/dev/null; " +
-              "git diff --cached --name-only -- Source/ 2>/dev/null; " +
-              "git ls-files --others --exclude-standard Source/ 2>/dev/null"
+              "{ git diff --name-only 2>/dev/null; git diff --cached --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | " +
+              "grep -iE '^(Source/|src/|backend/|frontend/|lib/|app/|services/|routes/|components/|pages/)' | head -50"
             ],
             { label: "impl-verify", quiet: true }
           );
           const changedFiles = diffCheck.stdout.trim();
           if (!changedFiles) {
-            console.error(`[${run.id}] Implementation passed (exitCode=0) but NO Source/ files were modified — marking as FAILED`);
+            console.error(`[${run.id}] Implementation passed (exitCode=0) but NO code files were modified — marking as FAILED`);
             run.phases[stageKey].status = "failed";
             run.phases[stageKey].noSourceChanges = true;
             passed = false;
@@ -947,9 +946,8 @@ ${feedback}`;
             const retryDiff = await this.containerManager.execInWorker(
               containerId, "bash", ["-c",
                 "cd /workspace && " +
-                "git diff --name-only -- Source/ 2>/dev/null; " +
-                "git diff --cached --name-only -- Source/ 2>/dev/null; " +
-                "git ls-files --others --exclude-standard Source/ 2>/dev/null"
+                "{ git diff --name-only 2>/dev/null; git diff --cached --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | " +
+                "grep -iE '^(Source/|src/|backend/|frontend/|lib/|app/|services/|routes/|components/|pages/)' | head -50"
               ],
               { label: "impl-retry-verify", quiet: true }
             );
@@ -1345,11 +1343,20 @@ ${feedback}`;
       // ── Finalize ──
       this.registry.update(run.id, {
         status: run.status,
-        appRunning: !!(run.app && run.app.running),
+        appRunning: false,
         currentPhase: null,
         phaseStartedAt: null,
       });
       saveRunFn(run);
+
+      // Auto-cleanup worker container (keep volume for retries if failed)
+      try {
+        const keepVolume = run.status !== "complete";
+        console.log(`[${run.id}] Cleaning up worker (status=${run.status}, keepVolume=${keepVolume})...`);
+        await this.containerManager.teardown(run.id, { keepVolume, keepBranch: true });
+      } catch (cleanupErr) {
+        console.warn(`[${run.id}] Worker cleanup warning: ${cleanupErr.message}`);
+      }
 
     } catch (err) {
       console.error(`[${run.id}] Workflow error:`, err);
