@@ -189,6 +189,10 @@ If any gate fails: fix it, re-run the full gate sequence, then mark done.
 
 ## Session Hygiene
 
-- `/clear` between unrelated tasks
+- `/clear` between unrelated tasks -- carrying dead context wastes tokens
 - At 70% context, compact or start fresh
 - Corrected twice on same mistake? `/clear` and restart
+- **Read files with offset+limit** -- never read a full 1000+ line file when you need 20 lines
+- **Grep before launching agents** -- 3 targeted greps beat a sub-agent for most investigations
+- **Commit and push after each logical change** -- don't accumulate uncommitted work across topics
+- **Check browser console errors** when testing any UI change -- screenshots alone prove nothing
