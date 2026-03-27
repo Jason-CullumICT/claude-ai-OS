@@ -182,9 +182,11 @@ ${dispatchContent.slice(0, 12000)}
       if (runId) {
         p += `\n\nE2E Test Generation (MANDATORY):
 Write Playwright E2E test files at Source/E2E/tests/cycle-${runId}/ that verify
-the feature works in a real browser. Tests must run against http://localhost:5173.
+the feature works in a real browser. IMPORTANT: Use RELATIVE URLs (e.g. '/' or '/work-items'),
+NOT absolute URLs. The pipeline provides a Playwright config with the correct baseURL —
+hardcoding http://localhost:5173 will break in the pipeline.
 Use @playwright/test. Each test file should:
-1. Navigate to each new/modified page
+1. Navigate to each new/modified page using RELATIVE paths
 2. Verify key UI elements are present (headings, forms, buttons)
 3. Fill out forms, submit, verify response
 4. Click through the primary user flow for the feature
@@ -194,7 +196,7 @@ Test template:
 import { test, expect } from '@playwright/test';
 test.describe('Feature: {name}', () => {
   test('should render the main page', async ({ page }) => {
-    await page.goto('http://localhost:5173/{route}');
+    await page.goto('/{route}');
     await expect(page.getByRole('heading', { name: '{heading}' })).toBeVisible();
   });
 });`;

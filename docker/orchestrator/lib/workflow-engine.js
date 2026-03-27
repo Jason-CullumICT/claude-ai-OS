@@ -961,10 +961,10 @@ ${feedback}`;
               "cd /workspace && " +
               "if git rev-parse --git-dir >/dev/null 2>&1; then " +
               "  { git diff --name-only 2>/dev/null; git diff --cached --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | " +
-              "  grep -iE '^(Source/|src/|backend/|frontend/|lib/|app/|services/|routes/|components/|pages/)' | head -50; " +
+              "  grep -iE '^(Source/|src/|backend/|frontend/|lib/|app/|services/|routes/|components/|pages/|docker/orchestrator/|Teams/|Specifications/)' | head -50; " +
               "else " +
-              "  find . -maxdepth 4 -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.jsx' 2>/dev/null | " +
-              "  grep -iE '/(Source|src|backend|frontend|lib|app|services|routes|components|pages)/' | head -50; " +
+              "  find . -maxdepth 4 -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.jsx' -o -name '*.md' -o -name '*.sh' 2>/dev/null | " +
+              "  grep -iE '/(Source|src|backend|frontend|lib|app|services|routes|components|pages|docker|orchestrator|Teams)/' | head -50; " +
               "fi"
             ],
             { label: "impl-verify", quiet: true }
@@ -978,7 +978,7 @@ ${feedback}`;
             // Inject feedback so the feedback loop can re-run with a clear message
             for (const ar of agentResults) {
               ar.exitCode = 1;
-              ar.outputTail += "\n\nFAILED: No Source/ files were modified. You MUST edit Source/ files to implement the assigned FRs. Writing plans, reports, or analysis is NOT sufficient — you must write code.";
+              ar.outputTail += "\n\nFAILED: No code files were modified. You MUST edit source code files to implement the assigned FRs. Writing plans, reports, or analysis is NOT sufficient — you must write code. Source files may be in Source/, docker/orchestrator/, Teams/, or other project-specific directories.";
             }
             saveRunFn(run);
           } else {
@@ -1025,7 +1025,7 @@ ${feedback}`;
               containerId, "bash", ["-c",
                 "cd /workspace && " +
                 "{ git diff --name-only 2>/dev/null; git diff --cached --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | " +
-                "grep -iE '^(Source/|src/|backend/|frontend/|lib/|app/|services/|routes/|components/|pages/)' | head -50"
+                "grep -iE '^(Source/|src/|backend/|frontend/|lib/|app/|services/|routes/|components/|pages/|docker/orchestrator/|Teams/|Specifications/)' | head -50"
               ],
               { label: "impl-retry-verify", quiet: true }
             );
