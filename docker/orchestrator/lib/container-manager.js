@@ -396,11 +396,14 @@ wait
         `git rm -r --cached .playwright/ 2>/dev/null || true && ` +
         `git reset HEAD -- '*.db-shm' '*.db-wal' 2>/dev/null || true && ` +
         `git add -A && ` +
-        // Use subshell grouping to fix operator precedence:
-        // only push if commit succeeds (or nothing to commit)
+        // Commit if there are staged changes
         `if ! git diff --cached --quiet 2>/dev/null; then ` +
-        `git commit -m "${safeMsg}" && git push origin "cycle/${runId}"; ` +
-        `else echo "No staged changes to commit"; fi`
+        `git commit -m "${safeMsg}"; fi && ` +
+        // Push if there are any unpushed commits (whether we just committed or coders committed earlier)
+        `UNPUSHED=$(git log --oneline origin/${runId.includes('/') ? runId : 'cycle/' + runId}..HEAD 2>/dev/null | wc -l || echo 999) && ` +
+        `if [ "$UNPUSHED" -gt 0 ] 2>/dev/null || ! git ls-remote --heads origin "cycle/${runId}" | grep -q .; then ` +
+        `git push origin "HEAD:cycle/${runId}"; ` +
+        `else echo "No unpushed commits"; fi`
       ],
       { label: "git", quiet: true }
     );
