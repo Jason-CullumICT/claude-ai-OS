@@ -960,7 +960,7 @@ ${feedback}`;
             containerId, "bash", ["-c",
               "cd /workspace && " +
               "if git rev-parse --git-dir >/dev/null 2>&1; then " +
-              "  { git diff --name-only 2>/dev/null; git diff --cached --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | " +
+              "  { git diff --name-only 2>/dev/null; git diff --cached --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; git diff --name-only $(git merge-base HEAD origin/master 2>/dev/null || echo HEAD~5) HEAD 2>/dev/null; } | sort -u | " +
               "  grep -iE '^(Source/|src/|backend/|frontend/|lib/|app/|services/|routes/|components/|pages/|docker/orchestrator/|platform/|portal/|Teams/|Specifications/)' | head -50; " +
               "else " +
               "  find . -maxdepth 4 -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.jsx' -o -name '*.md' -o -name '*.sh' 2>/dev/null | " +
@@ -1024,7 +1024,7 @@ ${feedback}`;
             const retryDiff = await this.containerManager.execInWorker(
               containerId, "bash", ["-c",
                 "cd /workspace && " +
-                "{ git diff --name-only 2>/dev/null; git diff --cached --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | " +
+                "{ git diff --name-only 2>/dev/null; git diff --cached --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; git diff --name-only $(git merge-base HEAD origin/master 2>/dev/null || echo HEAD~5) HEAD 2>/dev/null; } | sort -u | " +
                 "grep -iE '^(Source/|src/|backend/|frontend/|lib/|app/|services/|routes/|components/|pages/|docker/orchestrator/|platform/|portal/|Teams/|Specifications/)' | head -50"
               ],
               { label: "impl-retry-verify", quiet: true }
