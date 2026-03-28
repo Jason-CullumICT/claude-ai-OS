@@ -961,10 +961,10 @@ ${feedback}`;
               "cd /workspace && " +
               "if git rev-parse --git-dir >/dev/null 2>&1; then " +
               "  { git diff --name-only 2>/dev/null; git diff --cached --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | " +
-              "  grep -iE '^(Source/|src/|backend/|frontend/|lib/|app/|services/|routes/|components/|pages/|docker/orchestrator/|Teams/|Specifications/)' | head -50; " +
+              "  grep -iE '^(Source/|src/|backend/|frontend/|lib/|app/|services/|routes/|components/|pages/|docker/orchestrator/|platform/|portal/|Teams/|Specifications/)' | head -50; " +
               "else " +
               "  find . -maxdepth 4 -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.jsx' -o -name '*.md' -o -name '*.sh' 2>/dev/null | " +
-              "  grep -iE '/(Source|src|backend|frontend|lib|app|services|routes|components|pages|docker|orchestrator|Teams)/' | head -50; " +
+              "  grep -iE '/(Source|src|backend|frontend|lib|app|services|routes|components|pages|docker|orchestrator|platform|portal|Teams)/' | head -50; " +
               "fi"
             ],
             { label: "impl-verify", quiet: true }
@@ -1025,7 +1025,7 @@ ${feedback}`;
               containerId, "bash", ["-c",
                 "cd /workspace && " +
                 "{ git diff --name-only 2>/dev/null; git diff --cached --name-only 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | " +
-                "grep -iE '^(Source/|src/|backend/|frontend/|lib/|app/|services/|routes/|components/|pages/|docker/orchestrator/|Teams/|Specifications/)' | head -50"
+                "grep -iE '^(Source/|src/|backend/|frontend/|lib/|app/|services/|routes/|components/|pages/|docker/orchestrator/|platform/|portal/|Teams/|Specifications/)' | head -50"
               ],
               { label: "impl-retry-verify", quiet: true }
             );
